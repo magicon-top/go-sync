@@ -1,37 +1,38 @@
 package main
 
 import (
-	"fmt" // Format package
 	"log" // Logging package
 	"os"  // OS operations
 	"path/filepath" // Path manipulation
-	"syscall" // Windows syscalls
+	"strings" // String operations
 
 	"github.com/fsnotify/fsnotify" // File watcher library
+	"github.com/gen2brain/beeep"     // Notification library
 	"github.com/getlantern/systray"  // System tray library
 )
 
-var (
-	kernel32 = syscall.NewLazyDLL("kernel32.dll") // Load Windows kernel32 DLL
-	procBeep = kernel32.NewProc("Beep")           // Get procedure address for Beep
-)
-
 //________________________________________________________
-//Plays a system beep sound via Windows API
-func playBeep() {
-	procBeep.Call(uintptr(800), uintptr(150)) // Frequency: 800Hz, Duration: 150ms
+//Displays a temporary notification pop-up
+func showNotification(title string, message string) {
+	_ = beeep.Notify(title, message, "") // Show system notification banner
 }
 
 //________________________________________________________
-//Adds directory and all subdirectories to the watcher
+//Adds directory and valid subdirectories to the watcher
 func addRecursiveWatch(watcher *fsnotify.Watcher, root string) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error { // Walk directory tree
 		if err != nil { // Handle access errors
-			return nil // Skip inaccessible folders
+			return filepath.SkipDir // Skip inaccessible folders completely
 		} // End check
-		if info.IsDir() { // If entry is a folder
-			err = watcher.Add(path) // Watch directory
-			if err != nil { // Handle add error
+
+		if info.IsDir() { // Check if entry is a folder
+			base := filepath.Base(path) // Get folder name
+			if strings.HasPrefix(base, "$") || base == "System Volume Information" { // Match system folders
+				return filepath.SkipDir // Skip folder traversal
+			} // End check
+
+			err = watcher.Add(path) // Add valid directory to watcher
+			if err != nil { // Handle error on watch
 				log.Println("Error watching path:", path, err) // Log error
 			} // End check
 		} // End check
@@ -66,7 +67,20 @@ func startWatcher() {
 				} // End check
 
 				if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove|fsnotify.Rename) != 0 { // Match target operations
-					playBeep() // Emit sound feedback
+					var action string // Action description variable
+
+					switch { // Determine operation type
+					case event.Op&fsnotify.Create != 0: // File or directory created
+						action = "Создан" // Set created label
+					case event.Op&fsnotify.Write != 0: // File content updated
+						action = "Изменен" // Set updated label
+					case event.Op&fsnotify.Remove != 0: // File or directory removed
+						action = "Удален" // Set removed label
+					case event.Op&fsnotify.Rename != 0: // File or directory renamed
+						action = "Переименован" // Set renamed label
+					} // End switch
+
+					showNotification("Изменение на диске D:", action+": "+event.Name) // Trigger notification call
 
 					if event.Op&fsnotify.Create != 0 { // Check if new item created
 						fi, err := os.Stat(event.Name) // Inspect created item
@@ -117,6 +131,7 @@ func onReady() {
 func onExit() {
 	// Cleanup procedures if required
 }
+
 
 //________________________________________________________
 //Main application entry point

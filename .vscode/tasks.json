@@ -1,0 +1,22 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "go build and run (GUI)",
+      "type": "shell",
+      "options": {
+        "cwd": "${workspaceFolder}/src",
+        "shell": {
+          "executable": "powershell.exe",
+          "args": ["-Command"]
+        }
+      },
+      "command": "$ws = '${workspaceFolder}'; $pName = Split-Path $ws -Leaf; if (-not (Test-Path 'go.mod')) { go mod init $pName }; $env:GOPROXY='https://proxy.golang.org,direct'; $env:GOSUMDB='off'; go mod tidy -v; $modDir = Join-Path $env:USERPROFILE 'go/pkg/mod/github.com/pdfcpu'; $targets = Get-ChildItem -Path $modDir -Recurse -Include 'samples','testdata' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName; if ($targets) { Get-ChildItem -Path $targets -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $_.Attributes = 'Normal' }; Remove-Item -Path $targets -Recurse -Force -ErrorAction SilentlyContinue }; $rootDir = Split-Path $ws -Parent; $targetDir = Join-Path (Join-Path $rootDir '_bin') $pName; if (-not (Test-Path $targetDir)) { New-Item -ItemType Directory -Path $targetDir -Force | Out-Null }; $localBin = Join-Path $ws 'bin'; if (Test-Path $localBin) { robocopy $localBin $targetDir /E /XO /NJH /NJS /NDL /NC /NS | Out-Null }; $exePath = Join-Path $targetDir ($pName + '.exe'); Stop-Process -Name $pName -Force -ErrorAction SilentlyContinue; go build -ldflags=\"-H=windowsgui\" -v -o $exePath .; if ($?) { Start-Process -FilePath $exePath -WorkingDirectory $targetDir }",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$go"]
+    }
+  ]
+}
