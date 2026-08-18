@@ -636,12 +636,7 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 		case "run":
 			command := rule.Target
 
-			fileNameOnly := ""                     // Initialize empty file string
-			if !isDir {                            // Assign base name only if it is not a directory
-				fileNameOnly = filepath.Base(filePath) // Extract only filename
-			}
-
-			command = strings.ReplaceAll(command, "$file", fileNameOnly)             // Replace variable with empty string or filename
+			command = strings.ReplaceAll(command, "$file", filepath.Base(filePath))  // Replace $file with base name
 			command = strings.ReplaceAll(command, "$folder", filepath.Dir(filePath)) // Replace $folder
 			command = strings.ReplaceAll(command, "$name", filepath.Base(filePath))  // Replace $name
 			command = strings.ReplaceAll(command, "$ext", filepath.Ext(filePath))    // Replace $ext
