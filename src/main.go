@@ -43,13 +43,15 @@ type FTPConnection struct {
 }
 
 var (
-	ftpConns       = make(map[string]*FTPConnection) // Cache for FTP connections
-	ftpMutex       sync.Mutex                        // Mutex for FTP cache
-	logMutex       sync.Mutex                        // Mutex for log file
-	ruleCache      = make(map[string]CachedRules)    // Cache for parsed rules
-	ruleCacheMutex sync.Mutex                        // Mutex for rules cache
-	ignoreCache    = make(map[string]CachedIgnore)   // Cache for ignore patterns
-	ignoreMutex    sync.Mutex                        // Mutex for ignore cache
+	ftpConns         = make(map[string]*FTPConnection) // Cache for FTP connections
+	ftpMutex         sync.Mutex                        // Mutex for FTP cache
+	logMutex         sync.Mutex                        // Mutex for log file
+	ruleCache        = make(map[string]CachedRules)    // Cache for parsed rules
+	ruleCacheMutex   sync.Mutex                        // Mutex for rules cache
+	ignoreCache      = make(map[string]CachedIgnore)   // Cache for ignore patterns
+	ignoreMutex      sync.Mutex                        // Mutex for ignore cache
+	operationHistory = make(map[string]time.Time)      // Track recent operations
+	historyMutex     sync.Mutex                        // Mutex for history
 )
 
 func init() {
@@ -139,15 +141,79 @@ func logToFile(opType, detail string) {
 	// Выравнивание opType до 12 символов
 	opTypeAligned := fmt.Sprintf("%-12s", opType)
 	
-	// Выравнивание detail до 50 символов (обрезаем если слишком длинный)
-	detailAligned := detail
-	if len(detail) > 100 {
-		detailAligned = detail[:97] + "..."
+	// Форматирование с выравниванием
+	logEntry := fmt.Sprintf("[%s] %s | %s\n", timestamp, opTypeAligned, detail) // Format log entry
+	file.WriteString(logEntry) // Write to file
+}
+
+//________________________________________________________
+//Check if file should never be copied
+func isProtectedFile(fileName string) bool {
+	lowerName := strings.ToLower(fileName)
+	return lowerName == ".autorun" || lowerName == ".autoignore"
+}
+
+//________________________________________________________
+//Check if operation was recently performed
+func isRecentlyProcessed(srcPath, destPath string) bool {
+	historyMutex.Lock()
+	defer historyMutex.Unlock()
+	
+	key := fmt.Sprintf("%s|%s", strings.ToLower(srcPath), strings.ToLower(destPath))
+	if lastTime, exists := operationHistory[key]; exists {
+		if time.Since(lastTime) < 5*time.Second { // 5 seconds window
+			return true
+		}
+		delete(operationHistory, key) // Clean old entry
+	}
+	return false
+}
+
+//________________________________________________________
+//Mark operation as processed
+func markProcessed(srcPath, destPath string) {
+	historyMutex.Lock()
+	defer historyMutex.Unlock()
+	
+	key := fmt.Sprintf("%s|%s", strings.ToLower(srcPath), strings.ToLower(destPath))
+	operationHistory[key] = time.Now()
+	
+	// Clean old entries periodically
+	if len(operationHistory) > 1000 {
+		now := time.Now()
+		for k, v := range operationHistory {
+			if now.Sub(v) > 10*time.Second {
+				delete(operationHistory, k)
+			}
+		}
+	}
+}
+
+//________________________________________________________
+//Detect and prevent sync loops
+func detectSyncLoop(srcPath string, destPath string) bool {
+	// Normalize paths for comparison
+	srcAbs, err1 := filepath.Abs(srcPath)
+	destAbs, err2 := filepath.Abs(destPath)
+	if err1 != nil || err2 != nil {
+		return false
 	}
 	
-	// Формат: [timestamp] TYPE         | Detail
-	logEntry := fmt.Sprintf("[%s] %s | %s\n", timestamp, opTypeAligned, detailAligned)
-	file.WriteString(logEntry) // Write to file
+	srcAbs = strings.ToLower(filepath.Clean(srcAbs))
+	destAbs = strings.ToLower(filepath.Clean(destAbs))
+	
+	// Check if destination is inside source directory or vice versa
+	if strings.HasPrefix(destAbs, srcAbs) || strings.HasPrefix(srcAbs, destAbs) {
+		// Check if destination has its own .autorun
+		destConfigPath := filepath.Join(destAbs, ".autorun")
+		if _, err := os.Stat(destConfigPath); err == nil {
+			fmt.Printf("[WARNING] Sync loop detected: %s <-> %s\n", srcPath, destPath)
+			logToFile("SYNC_LOOP", fmt.Sprintf("Prevented loop: %s -> %s", srcPath, destPath))
+			return true
+		}
+	}
+	
+	return false
 }
 
 //________________________________________________________
@@ -177,9 +243,26 @@ func loadIgnoreRulesCached(ignorePath string, configDir string) ([]string, error
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line != "" && !strings.HasPrefix(line, "#") {
-			patterns = append(patterns, line)
+		
+		// Skip empty lines
+		if line == "" {
+			continue
 		}
+		
+		// Skip full-line comments
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		// Handle inline comments (remove everything after #)
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+			if line == "" {
+				continue
+			}
+		}
+		
+		patterns = append(patterns, line)
 	}
 
 	ignoreCache[ignorePath] = CachedIgnore{
@@ -323,8 +406,22 @@ func parseSyncFile(filePath, configDir string) ([]SyncRule, error) {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text()) // Trim line
 
-		if line == "" || strings.HasPrefix(line, "#") { // Skip empty or commented lines
-			continue 
+		// Skip empty lines
+		if line == "" {
+			continue
+		}
+		
+		// Skip full-line comments
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		// Handle inline comments (remove everything after #)
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = strings.TrimSpace(line[:idx])
+			if line == "" {
+				continue
+			}
 		}
 
 		// Check if line starts with action (no pattern specified)
@@ -772,11 +869,29 @@ func getTargetPath(srcPath string, rule SyncRule) string {
 }
 
 //________________________________________________________
-//Copy file using rule (preserving directory structure)
+//Copy file using rule (preserving directory structure) with loop prevention
 func copyFileWithRule(srcPath string, rule SyncRule) {
+	// Check if file is protected
+	if isProtectedFile(filepath.Base(srcPath)) {
+		fmt.Printf("[SKIP] Protected file not copied: %s\n", srcPath)
+		logToFile("PROTECTED_SKIP", fmt.Sprintf("Not copying protected file: %s", srcPath))
+		return
+	}
+	
 	relPath := getTargetPath(srcPath, rule) // Get relative target path
 	destPath := filepath.Join(rule.Target, relPath) // Construct absolute destination path
-
+	
+	// Check for sync loop
+	if detectSyncLoop(srcPath, destPath) {
+		return // Skip operation
+	}
+	
+	// Check if recently processed
+	if isRecentlyProcessed(srcPath, destPath) {
+		fmt.Printf("[SKIP] Recently processed: %s -> %s\n", srcPath, destPath)
+		return
+	}
+	
 	fi, err := os.Stat(srcPath) // Stat source path
 	if err != nil {
 		return // Exit on error
@@ -785,13 +900,14 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 	if fi.IsDir() { // If directory
 		os.MkdirAll(destPath, 0755) // Recreate directory structure
 		logToFile("MKDIR", destPath) // Log action
+		markProcessed(srcPath, destPath)
 		return // Exit
 	}
 
 	os.MkdirAll(filepath.Dir(destPath), 0755) // Ensure target directory exists
 
 	var data []byte // Byte slice for data
-	for i := 0; i < 3; i++ { // Retry reading up to 3 times if file is temporarily locked by another process
+	for i := 0; i < 3; i++ { // Retry reading up to 3 times
 		data, err = os.ReadFile(srcPath) // Try to read file
 		if err == nil {
 			break // Exit loop on success
@@ -809,13 +925,22 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 		logToFile("COPY_ERROR", fmt.Sprintf("Write failed to %s: %v", destPath, err)) // Log write error
 		return // Exit
 	}
-
+	
+	// Mark operation as processed
+	markProcessed(srcPath, destPath)
+	
 	logToFile("COPY", fmt.Sprintf("%s -> %s", srcPath, destPath)) // Log success
 }
 
 //________________________________________________________
 //Execute sync rules dynamically found from .autorun hierarchy
 func executeRules(filePath string, action uint32, isDir bool, oldPath string, oldIsDir bool) {
+	// Check if file is protected at the beginning
+	if isProtectedFile(filepath.Base(filePath)) {
+		fmt.Printf("[SKIP] Protected file: %s\n", filePath)
+		return
+	}
+	
 	rules := getRulesForPath(filePath) // Gather rules dynamically
 	if len(rules) == 0 {
 		return // Exit if no rules
@@ -834,7 +959,7 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 		switch rule.Action {
 		case "copy":
 			if action == windows.FILE_ACTION_ADDED || action == windows.FILE_ACTION_MODIFIED {
-				copyFileWithRule(filePath, rule) // Copy file
+				copyFileWithRule(filePath, rule) // Copy file (with loop protection)
 			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
 				copyFileWithRule(filePath, rule) // Copy new file
 				oldRelPath := getTargetPath(oldPath, rule) // Get old relative path
@@ -845,7 +970,7 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 
 		case "sync":
 			if action == windows.FILE_ACTION_ADDED || action == windows.FILE_ACTION_MODIFIED {
-				copyFileWithRule(filePath, rule) // Copy file
+				copyFileWithRule(filePath, rule) // Copy file (with loop protection)
 			} else if action == windows.FILE_ACTION_REMOVED {
 				relPath := getTargetPath(filePath, rule) // Get relative path
 				targetPath := filepath.Join(rule.Target, relPath) // Construct target
