@@ -20,7 +20,8 @@ import (
 )
 
 type SyncRule struct {
-	Pattern string
+	BaseDir string // Директория, в которой был найден .go-sync.txt
+	Pattern string // Чистая маска (например, *.txt)
 	Action  string
 	Target  string
 }
@@ -52,17 +53,17 @@ func init() {
 //________________________________________________________
 //Enables ANSI escape codes in Windows console
 func enableVirtualTerminalProcessing() {
-	stdout := windows.Handle(os.Stdout.Fd()) // Get stdout handle
+	stdout := windows.Handle(os.Stdout.Fd())
 	var mode uint32
-	windows.GetConsoleMode(stdout, &mode) // Get console mode
-	windows.SetConsoleMode(stdout, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING) // Enable virtual terminal processing
+	windows.GetConsoleMode(stdout, &mode)
+	windows.SetConsoleMode(stdout, mode|windows.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
 }
 
 //________________________________________________________
 //Prints colored event string to the console
 func printColoredEvent(action uint32, isDir bool, text string) {
 	var colorCode string
-	reset := "\033[0m" // Reset color code
+	reset := "\033[0m"
 
 	switch action {
 	case windows.FILE_ACTION_ADDED:
@@ -93,56 +94,56 @@ func printColoredEvent(action uint32, isDir bool, text string) {
 		colorCode = "\033[37m"        // White FG
 	}
 
-	timestamp := time.Now().Format("15:04:05") // Format current time
-	fmt.Printf("[%s] %s%s%s\n", timestamp, colorCode, text, reset) // Print colored log
+	timestamp := time.Now().Format("15:04:05")
+	fmt.Printf("[%s] %s%s%s\n", timestamp, colorCode, text, reset)
 }
 
 //________________________________________________________
 //Writes log entries with size check and rotation at 50MB
 func logToFile(opType, detail string) {
-	logMutex.Lock() // Lock log mutex
-	defer logMutex.Unlock() // Unlock log mutex
+	logMutex.Lock()
+	defer logMutex.Unlock()
 
-	exePath, err := os.Executable() // Get executable path
+	exePath, err := os.Executable()
 	if err != nil {
 		return
 	}
 
-	exeDir := filepath.Dir(exePath) // Get executable directory
-	logPath := filepath.Join(exeDir, "go-sync.log") // Log path
-	oldLogPath := filepath.Join(exeDir, "go-sync_old.log") // Old log path
+	exeDir := filepath.Dir(exePath)
+	logPath := filepath.Join(exeDir, "go-sync.log")
+	oldLogPath := filepath.Join(exeDir, "go-sync_old.log")
 
-	if fi, err := os.Stat(logPath); err == nil { // Check log file info
-		if fi.Size() >= 50*1024*1024 { // Check if size >= 50MB
-			os.Remove(oldLogPath) // Remove old log file
-			os.Rename(logPath, oldLogPath) // Rotate log file
+	if fi, err := os.Stat(logPath); err == nil {
+		if fi.Size() >= 50*1024*1024 {
+			os.Remove(oldLogPath)
+			os.Rename(logPath, oldLogPath)
 		}
 	}
 
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644) // Open log file
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return
 	}
-	defer file.Close() // Close file
+	defer file.Close()
 
-	timestamp := time.Now().Format("2006-01-02 15:04:05") // Format timestamp
-	logEntry := fmt.Sprintf("[%s] %s | %s\n", timestamp, opType, detail) // Format log entry
-	file.WriteString(logEntry) // Write log entry
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	logEntry := fmt.Sprintf("[%s] %s | %s\n", timestamp, opType, detail)
+	file.WriteString(logEntry)
 }
 
 //________________________________________________________
 //Loads .watchignore rules from file near executable
 func loadIgnoreRules() ignore.IgnoreMatcher {
-	exePath, err := os.Executable() // Get executable path
+	exePath, err := os.Executable()
 	var ignorePath string
 
 	if err == nil {
-		ignorePath = filepath.Join(filepath.Dir(exePath), ".watchignore") // Ignore path near exe
+		ignorePath = filepath.Join(filepath.Dir(exePath), ".watchignore")
 	} else {
-		ignorePath = ".watchignore" // Fallback ignore path
+		ignorePath = ".watchignore"
 	}
 
-	matcher, err := ignore.NewGitIgnore(ignorePath) // Create gitignore matcher
+	matcher, err := ignore.NewGitIgnore(ignorePath)
 	if err != nil {
 		return nil
 	}
@@ -151,45 +152,39 @@ func loadIgnoreRules() ignore.IgnoreMatcher {
 }
 
 //________________________________________________________
-//Parses .go-sync.txt and converts relative patterns to absolute based on config directory
+//Parses .go-sync.txt and creates rules
 func parseSyncFile(filePath, configDir string) ([]SyncRule, error) {
-	file, err := os.Open(filePath) // Open sync file
+	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close() // Close file
+	defer file.Close()
 
 	var rules []SyncRule
-	scanner := bufio.NewScanner(file) // Create scanner
+	scanner := bufio.NewScanner(file)
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text()) // Read line
+		line := strings.TrimSpace(scanner.Text())
 
-		if line == "" || strings.HasPrefix(line, "#") { // Skip empty lines and comments
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		parts := strings.SplitN(line, ";", 2) // Split pattern and action
+		parts := strings.SplitN(line, ";", 2)
 		if len(parts) != 2 {
 			continue
 		}
 
-		rawPattern := strings.TrimSpace(parts[0]) // Get raw pattern
-		action := strings.TrimSpace(parts[1]) // Get action string
+		rawPattern := strings.TrimSpace(parts[0])
+		action := strings.TrimSpace(parts[1])
 
 		if rawPattern == "" || action == "" {
 			continue
 		}
 
-		var absPattern string
-		if filepath.IsAbs(rawPattern) {
-			absPattern = rawPattern // Use absolute pattern as is
-		} else {
-			absPattern = filepath.Join(configDir, rawPattern) // Make pattern absolute relative to config directory
-		}
-
 		rule := SyncRule{
-			Pattern: absPattern,
+			BaseDir: configDir,  // Запоминаем папку конфига
+			Pattern: rawPattern, // Оставляем чистую маску (например, *.txt)
 		}
 
 		if strings.HasPrefix(action, "<> ftp://") {
@@ -218,20 +213,20 @@ func parseSyncFile(filePath, configDir string) ([]SyncRule, error) {
 //________________________________________________________
 //Loads rules from .go-sync.txt with caching based on ModTime and Size
 func loadRulesCached(configPath string, configDir string) ([]SyncRule, error) {
-	fi, err := os.Stat(configPath) // Get file info for cache check
+	fi, err := os.Stat(configPath)
 	if err != nil {
 		return nil, err
 	}
 
-	ruleCacheMutex.Lock() // Lock cache mutex
-	defer ruleCacheMutex.Unlock() // Unlock cache mutex
+	ruleCacheMutex.Lock()
+	defer ruleCacheMutex.Unlock()
 
-	cached, exists := ruleCache[configPath] // Check cache existence
+	cached, exists := ruleCache[configPath]
 	if exists && cached.ModTime.Equal(fi.ModTime()) && cached.Size == fi.Size() {
-		return cached.Rules, nil // Return cached rules if file hasn't changed
+		return cached.Rules, nil
 	}
 
-	rules, err := parseSyncFile(configPath, configDir) // Parse sync file
+	rules, err := parseSyncFile(configPath, configDir)
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +235,7 @@ func loadRulesCached(configPath string, configDir string) ([]SyncRule, error) {
 		ModTime: fi.ModTime(),
 		Size:    fi.Size(),
 		Rules:   rules,
-	} // Save rules to cache
+	}
 	return rules, nil
 }
 
@@ -249,20 +244,20 @@ func loadRulesCached(configPath string, configDir string) ([]SyncRule, error) {
 func getRulesForPath(filePath string) []SyncRule {
 	var allRules []SyncRule
 
-	dir := filepath.Dir(filePath) // Get directory of event file
-	drive := filepath.VolumeName(dir) + "\\" // Get drive root
+	dir := filepath.Dir(filePath)
+	drive := filepath.VolumeName(dir) + "\\"
 	if drive == "\\" || drive == "" {
-		drive = "D:\\" // Fallback drive root
+		drive = "D:\\"
 	}
 
 	curr := dir
 	for {
-		configPath := filepath.Join(curr, ".go-sync.txt") // Construct config path
+		configPath := filepath.Join(curr, ".go-sync.txt")
 		if rules, err := loadRulesCached(configPath, curr); err == nil {
-			allRules = append(allRules, rules...) // Append loaded rules
+			allRules = append(allRules, rules...)
 		}
 
-		parent := filepath.Dir(curr) // Get parent directory
+		parent := filepath.Dir(curr)
 		if parent == curr || len(curr) <= len(drive) {
 			break
 		}
@@ -276,10 +271,10 @@ func getRulesForPath(filePath string) []SyncRule {
 //Parse FTP URL
 func parseFTPURL(url string) (host, user, pass, path string, err error) {
 	if strings.HasPrefix(url, "ftp://") {
-		url = strings.TrimPrefix(url, "ftp://") // Trim protocol prefix
+		url = strings.TrimPrefix(url, "ftp://")
 	}
 
-	parts := strings.SplitN(url, "/", 2) // Split host and path
+	parts := strings.SplitN(url, "/", 2)
 	if len(parts) == 0 {
 		return "", "", "", "", fmt.Errorf("invalid FTP URL")
 	}
@@ -287,7 +282,7 @@ func parseFTPURL(url string) (host, user, pass, path string, err error) {
 	hostPart := parts[0]
 	path = "/"
 	if len(parts) == 2 {
-		path = "/" + parts[1] // Set remote path
+		path = "/" + parts[1]
 	}
 
 	user = "anonymous"
@@ -311,7 +306,7 @@ func parseFTPURL(url string) (host, user, pass, path string, err error) {
 	host = hostPart
 
 	if !strings.Contains(host, ":") {
-		host = host + ":21" // Default FTP port
+		host = host + ":21"
 	}
 
 	return host, user, pass, path, nil
@@ -320,28 +315,28 @@ func parseFTPURL(url string) (host, user, pass, path string, err error) {
 //________________________________________________________
 //Get or create FTP connection
 func getFTPConnection(ftpURL string) (*FTPConnection, error) {
-	ftpMutex.Lock() // Lock FTP mutex
-	defer ftpMutex.Unlock() // Unlock FTP mutex
+	ftpMutex.Lock()
+	defer ftpMutex.Unlock()
 
 	if conn, exists := ftpConns[ftpURL]; exists {
 		if err := conn.Conn.NoOp(); err == nil {
-			return conn, nil // Return existing valid connection
+			return conn, nil
 		}
-		conn.Conn.Quit() // Quit broken connection
-		delete(ftpConns, ftpURL) // Delete from map
+		conn.Conn.Quit()
+		delete(ftpConns, ftpURL)
 	}
 
-	host, user, pass, _, err := parseFTPURL(ftpURL) // Parse FTP URL credentials
+	host, user, pass, _, err := parseFTPURL(ftpURL)
 	if err != nil {
 		return nil, err
 	}
 
-	conn, err := ftp.Dial(host, ftp.DialWithTimeout(5*time.Second)) // Dial FTP server
+	conn, err := ftp.Dial(host, ftp.DialWithTimeout(5*time.Second))
 	if err != nil {
 		return nil, fmt.Errorf("FTP dial error: %v", err)
 	}
 
-	err = conn.Login(user, pass) // Login to FTP server
+	err = conn.Login(user, pass)
 	if err != nil {
 		conn.Quit()
 		return nil, fmt.Errorf("FTP login error: %v", err)
@@ -351,18 +346,18 @@ func getFTPConnection(ftpURL string) (*FTPConnection, error) {
 		Conn: conn,
 	}
 
-	ftpConns[ftpURL] = ftpConn // Cache connection
+	ftpConns[ftpURL] = ftpConn
 	return ftpConn, nil
 }
 
 //________________________________________________________
 //Force closes and removes FTP connection from cache
 func forceCloseFTP(ftpURL string) {
-	ftpMutex.Lock() // Lock FTP mutex
-	defer ftpMutex.Unlock() // Unlock FTP mutex
+	ftpMutex.Lock()
+	defer ftpMutex.Unlock()
 	if conn, exists := ftpConns[ftpURL]; exists {
-		conn.Conn.Quit() // Quit connection
-		delete(ftpConns, ftpURL) // Delete from cache
+		conn.Conn.Quit()
+		delete(ftpConns, ftpURL)
 	}
 }
 
@@ -371,13 +366,13 @@ func forceCloseFTP(ftpURL string) {
 func uploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		err = doUploadToFTP(localPath, ftpURL, rule) // Try upload
+		err = doUploadToFTP(localPath, ftpURL, rule)
 		if err == nil {
 			return nil
 		}
 		fmt.Printf("[ERROR] FTP upload attempt %d failed: %v\n", attempt, err)
-		forceCloseFTP(ftpURL) // Force close connection on failure
-		time.Sleep(1 * time.Second) // Wait before retry
+		forceCloseFTP(ftpURL)
+		time.Sleep(1 * time.Second)
 	}
 	return err
 }
@@ -385,34 +380,34 @@ func uploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 //________________________________________________________
 //Core upload file or directory to FTP logic
 func doUploadToFTP(localPath, ftpURL string, rule SyncRule) error {
-	ftpConn, err := getFTPConnection(ftpURL) // Get FTP connection
+	ftpConn, err := getFTPConnection(ftpURL)
 	if err != nil {
 		return err
 	}
 
-	ftpConn.Mu.Lock() // Lock connection mutex
-	defer ftpConn.Mu.Unlock() // Unlock connection mutex
+	ftpConn.Mu.Lock()
+	defer ftpConn.Mu.Unlock()
 
-	host, _, _, ftpPath, err := parseFTPURL(ftpURL) // Parse FTP URL
+	host, _, _, ftpPath, err := parseFTPURL(ftpURL)
 	if err != nil {
 		return err
 	}
 
-	relPath := getTargetPath(localPath, rule) // Get relative target path
-	remotePath := filepath.ToSlash(filepath.Join(ftpPath, relPath)) // Convert to remote slash path
+	relPath := getTargetPath(localPath, rule)
+	remotePath := filepath.ToSlash(filepath.Join(ftpPath, relPath))
 	remotePath = strings.TrimPrefix(remotePath, "/")
 
-	fi, err := os.Stat(localPath) // Stat local path
+	fi, err := os.Stat(localPath)
 	if err != nil {
 		return fmt.Errorf("Error stat local file: %v", err)
 	}
 
 	if fi.IsDir() {
-		err = ftpConn.Conn.MakeDir(remotePath) // Make remote directory
+		err = ftpConn.Conn.MakeDir(remotePath)
 		if err != nil {
 			// Ignore if exists
 		}
-		logToFile("FTP_MKDIR", fmt.Sprintf("%s -> ftp://%s/%s", localPath, host, remotePath)) // Log FTP directory creation
+		logToFile("FTP_MKDIR", fmt.Sprintf("%s -> ftp://%s/%s", localPath, host, remotePath))
 		return nil
 	}
 
@@ -423,21 +418,21 @@ func doUploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 			continue
 		}
 		currentPath += "/" + dir
-		ftpConn.Conn.MakeDir(currentPath) // Ensure remote directory exists
+		ftpConn.Conn.MakeDir(currentPath)
 	}
 
-	file, err := os.Open(localPath) // Open local file
+	file, err := os.Open(localPath)
 	if err != nil {
 		return fmt.Errorf("Error opening local file: %v", err)
 	}
-	defer file.Close() // Close file
+	defer file.Close()
 
-	err = ftpConn.Conn.Stor(remotePath, file) // Upload file storage
+	err = ftpConn.Conn.Stor(remotePath, file)
 	if err != nil {
 		return fmt.Errorf("FTP upload error: %v", err)
 	}
 
-	logToFile("FTP_UPLOAD", fmt.Sprintf("%s -> ftp://%s/%s", localPath, host, remotePath)) // Log upload
+	logToFile("FTP_UPLOAD", fmt.Sprintf("%s -> ftp://%s/%s", localPath, host, remotePath))
 	return nil
 }
 
@@ -446,13 +441,13 @@ func doUploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 func deleteFromFTP(localPath, ftpURL string, rule SyncRule, isDir bool) error {
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		err = doDeleteFromFTP(localPath, ftpURL, rule, isDir) // Try delete
+		err = doDeleteFromFTP(localPath, ftpURL, rule, isDir)
 		if err == nil {
 			return nil
 		}
 		fmt.Printf("[ERROR] FTP delete attempt %d failed: %v\n", attempt, err)
-		forceCloseFTP(ftpURL) // Force close connection on failure
-		time.Sleep(1 * time.Second) // Wait before retry
+		forceCloseFTP(ftpURL)
+		time.Sleep(1 * time.Second)
 	}
 	return err
 }
@@ -460,35 +455,35 @@ func deleteFromFTP(localPath, ftpURL string, rule SyncRule, isDir bool) error {
 //________________________________________________________
 //Core delete file or directory from FTP logic
 func doDeleteFromFTP(localPath, ftpURL string, rule SyncRule, isDir bool) error {
-	ftpConn, err := getFTPConnection(ftpURL) // Get FTP connection
+	ftpConn, err := getFTPConnection(ftpURL)
 	if err != nil {
 		return err
 	}
 
-	ftpConn.Mu.Lock() // Lock connection mutex
-	defer ftpConn.Mu.Unlock() // Unlock connection mutex
+	ftpConn.Mu.Lock()
+	defer ftpConn.Mu.Unlock()
 
-	host, _, _, ftpPath, err := parseFTPURL(ftpURL) // Parse FTP URL
+	host, _, _, ftpPath, err := parseFTPURL(ftpURL)
 	if err != nil {
 		return err
 	}
 
-	relPath := getTargetPath(localPath, rule) // Get relative path
-	remotePath := filepath.ToSlash(filepath.Join(ftpPath, relPath)) // Convert to slash path
+	relPath := getTargetPath(localPath, rule)
+	remotePath := filepath.ToSlash(filepath.Join(ftpPath, relPath))
 	remotePath = strings.TrimPrefix(remotePath, "/")
 
 	if isDir {
-		err = removeFTPDirectory(ftpConn.Conn, remotePath) // Remove remote directory recursively
+		err = removeFTPDirectory(ftpConn.Conn, remotePath)
 		if err != nil {
 			return fmt.Errorf("FTP delete directory error: %v", err)
 		}
-		logToFile("FTP_RMDIR", fmt.Sprintf("ftp://%s/%s", host, remotePath)) // Log remote directory removal
+		logToFile("FTP_RMDIR", fmt.Sprintf("ftp://%s/%s", host, remotePath))
 	} else {
-		err = ftpConn.Conn.Delete(remotePath) // Delete remote file
+		err = ftpConn.Conn.Delete(remotePath)
 		if err != nil {
 			return fmt.Errorf("FTP delete error: %v", err)
 		}
-		logToFile("FTP_DELETE", fmt.Sprintf("ftp://%s/%s", host, remotePath)) // Log remote file deletion
+		logToFile("FTP_DELETE", fmt.Sprintf("ftp://%s/%s", host, remotePath))
 	}
 
 	return nil
@@ -497,28 +492,28 @@ func doDeleteFromFTP(localPath, ftpURL string, rule SyncRule, isDir bool) error 
 //________________________________________________________
 //Recursively remove directory from FTP
 func removeFTPDirectory(conn *ftp.ServerConn, path string) error {
-	entries, err := conn.List(path) // List directory entries
+	entries, err := conn.List(path)
 	if err != nil {
 		return err
 	}
 
 	for _, entry := range entries {
-		entryPath := filepath.ToSlash(filepath.Join(path, entry.Name)) // Construct entry path
+		entryPath := filepath.ToSlash(filepath.Join(path, entry.Name))
 
 		if entry.Type == ftp.EntryTypeFolder {
-			err = removeFTPDirectory(conn, entryPath) // Recursive call for subfolder
+			err = removeFTPDirectory(conn, entryPath)
 			if err != nil {
 				return err
 			}
 		} else {
-			err = conn.Delete(entryPath) // Delete file entry
+			err = conn.Delete(entryPath)
 			if err != nil {
 				return err
 			}
 		}
 	}
 
-	err = conn.RemoveDir(path) // Remove empty directory
+	err = conn.RemoveDir(path)
 	if err != nil {
 		return err
 	}
@@ -527,35 +522,80 @@ func removeFTPDirectory(conn *ftp.ServerConn, path string) error {
 }
 
 //________________________________________________________
-//Check if path matches pattern
-func matchPattern(pattern, path string) bool {
-	pattern = strings.ReplaceAll(pattern, "/", "\\") // Normalize separators
-	path = strings.ReplaceAll(path, "/", "\\")
+//Check if path matches standard gitignore-like inclusion pattern
+func matchPattern(rule SyncRule, fullPath string) bool {
+	baseDir := strings.ToLower(filepath.Clean(rule.BaseDir))
+	pathLower := strings.ToLower(filepath.Clean(fullPath))
 
-	patternLower := strings.ToLower(pattern) // Convert to lowercase
-	pathLower := strings.ToLower(path)
+	// Файл должен находиться внутри папки BaseDir
+	if !strings.HasPrefix(pathLower, baseDir) {
+		return false
+	}
 
+	// Получаем относительный путь файла от папки с конфигом
+	relPath := strings.TrimPrefix(pathLower, baseDir)
+	relPath = strings.TrimPrefix(relPath, "\\")
+	if relPath == "" {
+		return false
+	}
+
+	patternLower := strings.ToLower(strings.ReplaceAll(rule.Pattern, "/", "\\"))
+
+	// Direct match
+	if patternLower == relPath {
+		return true
+	}
+
+	// Universal wildcard (matches everything inside this scope)
+	if patternLower == "**" || patternLower == "*" {
+		return true
+	}
+
+	// Если в паттерне нет слэшей (например "*.txt"), ищем на любой глубине
+	if !strings.Contains(patternLower, "\\") {
+		matched, err := filepath.Match(patternLower, filepath.Base(relPath))
+		if err == nil && matched {
+			return true
+		}
+		// Поддержка поиска суффиксов
+		if strings.HasPrefix(patternLower, "*") {
+			ext := strings.TrimPrefix(patternLower, "*")
+			if strings.HasSuffix(relPath, ext) {
+				return true
+			}
+		}
+	}
+
+	// Handle patterns starting with "**/"
+	if strings.HasPrefix(patternLower, "**/") {
+		subPattern := strings.TrimPrefix(patternLower, "**/")
+		if m, _ := filepath.Match(subPattern, filepath.Base(relPath)); m {
+			return true
+		}
+		if strings.HasSuffix(relPath, "\\"+subPattern) || strings.Contains(relPath, "\\"+subPattern) {
+			return true
+		}
+	}
+
+	// Handle generic double star (**) matching
 	if strings.Contains(patternLower, "**") {
-		parts := strings.Split(patternLower, "**") // Handle double star pattern
+		parts := strings.Split(patternLower, "**")
 		if len(parts) == 2 {
-			return strings.HasPrefix(pathLower, parts[0]) && strings.HasSuffix(pathLower, parts[1])
+			prefix := strings.TrimSuffix(parts[0], "\\")
+			suffix := strings.TrimPrefix(parts[1], "\\")
+
+			hasPrefix := prefix == "" || strings.HasPrefix(relPath, prefix)
+			hasSuffix := suffix == "" || strings.HasSuffix(relPath, suffix)
+
+			if hasPrefix && hasSuffix {
+				return true
+			}
 		}
 	}
 
-	if strings.ContainsAny(patternLower, "*?") {
-		matched, err := filepath.Match(patternLower, pathLower) // Match file pattern
-		if err == nil && matched {
-			return true
-		}
-
-		_, fileName := filepath.Split(path)
-		matched, err = filepath.Match(patternLower, strings.ToLower(fileName)) // Match filename only
-		if err == nil && matched {
-			return true
-		}
-	}
-
-	if patternLower == pathLower {
+	// Standard glob match на относительный путь
+	matched, err := filepath.Match(patternLower, relPath)
+	if err == nil && matched {
 		return true
 	}
 
@@ -563,72 +603,58 @@ func matchPattern(pattern, path string) bool {
 }
 
 //________________________________________________________
-//Get target path for copy/sync operation
+//Get target path for copy/sync operation relative to BaseDir
 func getTargetPath(srcPath string, rule SyncRule) string {
-	basePattern := rule.Pattern
-
-	if idx := strings.Index(basePattern, "**"); idx != -1 {
-		basePattern = basePattern[:idx] // Strip wildcard suffix
-	} else if idx := strings.Index(basePattern, "*"); idx != -1 {
-		basePattern = basePattern[:idx]
+	relPath, err := filepath.Rel(rule.BaseDir, srcPath)
+	if err != nil {
+		return filepath.Base(srcPath) // Fallback to base name if error
 	}
-
-	basePattern = strings.ReplaceAll(basePattern, "/", "\\") // Normalize separators
-	srcPathNorm := strings.ReplaceAll(srcPath, "/", "\\")
-
-	relPath := ""
-	if strings.HasPrefix(strings.ToLower(srcPathNorm), strings.ToLower(basePattern)) {
-		relPath = srcPathNorm[len(basePattern):] // Get relative path portion
-		relPath = strings.TrimPrefix(relPath, "\\")
-	} else {
-		relPath = filepath.Base(srcPath) // Fallback to base name
-	}
-
 	return relPath
 }
 
 //________________________________________________________
 //Copy file using rule (preserving directory structure)
 func copyFileWithRule(srcPath string, rule SyncRule) {
-	relPath := getTargetPath(srcPath, rule) // Get relative path
-	destPath := filepath.Join(rule.Target, relPath) // Construct destination path
+	relPath := getTargetPath(srcPath, rule)
+	destPath := filepath.Join(rule.Target, relPath)
 
-	fi, err := os.Stat(srcPath) // Stat source path
+	fi, err := os.Stat(srcPath)
 	if err != nil {
 		return
 	}
 
 	if fi.IsDir() {
-		os.MkdirAll(destPath, 0755) // Create destination directory
-		logToFile("MKDIR", destPath) // Log directory creation
+		os.MkdirAll(destPath, 0755)
+		logToFile("MKDIR", destPath)
 		return
 	}
 
-	os.MkdirAll(filepath.Dir(destPath), 0755) // Ensure destination directory exists
+	os.MkdirAll(filepath.Dir(destPath), 0755)
 
-	data, err := os.ReadFile(srcPath) // Read source file
+	data, err := os.ReadFile(srcPath)
 	if err != nil {
 		return
 	}
 
-	err = os.WriteFile(destPath, data, 0644) // Write destination file
+	err = os.WriteFile(destPath, data, 0644)
 	if err != nil {
 		return
 	}
 
-	logToFile("COPY", fmt.Sprintf("%s -> %s", srcPath, destPath)) // Log file copy
+	logToFile("COPY", fmt.Sprintf("%s -> %s", srcPath, destPath))
 }
 
 //________________________________________________________
 //Execute sync rules dynamically found from .go-sync.txt hierarchy
 func executeRules(filePath string, action uint32, isDir bool, oldPath string, oldIsDir bool) {
-	rules := getRulesForPath(filePath) // Get rules from hierarchical .go-sync.txt files
+	rules := getRulesForPath(filePath)
 	if len(rules) == 0 {
 		return
 	}
 
 	for _, rule := range rules {
-		if !matchPattern(rule.Pattern, filePath) { // Check pattern match
+		// Проверка относительного пути к BaseDir
+		if !matchPattern(rule, filePath) {
 			continue
 		}
 
@@ -640,7 +666,7 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 				copyFileWithRule(filePath, rule)
 				oldRelPath := getTargetPath(oldPath, rule)
 				oldTarget := filepath.Join(rule.Target, oldRelPath)
-				os.Remove(oldTarget) // Remove old file after rename
+				os.Remove(oldTarget)
 				logToFile("DELETE", oldTarget)
 			}
 
@@ -651,9 +677,9 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 				relPath := getTargetPath(filePath, rule)
 				targetPath := filepath.Join(rule.Target, relPath)
 				if isDir {
-					os.RemoveAll(targetPath) // Remove directory recursively
+					os.RemoveAll(targetPath)
 				} else {
-					os.Remove(targetPath) // Remove file
+					os.Remove(targetPath)
 				}
 				logToFile("SYNC_DELETE", targetPath)
 			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
@@ -661,7 +687,7 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 				newRelPath := getTargetPath(filePath, rule)
 				oldTarget := filepath.Join(rule.Target, oldRelPath)
 				newTarget := filepath.Join(rule.Target, newRelPath)
-				os.Rename(oldTarget, newTarget) // Rename target file/dir
+				os.Rename(oldTarget, newTarget)
 				logToFile("SYNC_RENAME", fmt.Sprintf("%s -> %s", oldTarget, newTarget))
 			}
 
@@ -686,10 +712,11 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 		case "run":
 			command := rule.Target
 
-			command = strings.ReplaceAll(command, "$file", filepath.Base(filePath)) // Replace $file
-			command = strings.ReplaceAll(command, "$folder", filepath.Dir(filePath)) // Replace $folder
-			command = strings.ReplaceAll(command, "$name", filepath.Base(filePath)) // Replace $name
-			command = strings.ReplaceAll(command, "$ext", filepath.Ext(filePath)) // Replace $ext
+			// $file всегда содержит имя файла (или директории)
+			command = strings.ReplaceAll(command, "$file", filepath.Base(filePath))
+			command = strings.ReplaceAll(command, "$folder", filepath.Dir(filePath))
+			command = strings.ReplaceAll(command, "$name", filepath.Base(filePath))
+			command = strings.ReplaceAll(command, "$ext", filepath.Ext(filePath))
 
 			eventType := "modify"
 			switch action {
@@ -700,23 +727,23 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 			case windows.FILE_ACTION_RENAMED_OLD_NAME, windows.FILE_ACTION_RENAMED_NEW_NAME:
 				eventType = "rename"
 			}
-			command = strings.ReplaceAll(command, "$event", eventType) // Replace $event
+			command = strings.ReplaceAll(command, "$event", eventType)
 
 			typeStr := "file"
 			if isDir {
 				typeStr = "dir"
 			}
-			command = strings.ReplaceAll(command, "$type", typeStr) // Replace $type
+			command = strings.ReplaceAll(command, "$type", typeStr)
 
-			logToFile("RUN_COMMAND", command) // Log command execution
+			logToFile("RUN_COMMAND", command)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 
-			cmd := exec.CommandContext(ctx, "cmd", "/C", command) // Create command context
-			cmd.Dir = filepath.Dir(filePath) // Set working directory
-
-			output, err := cmd.CombinedOutput() // Execute command
+			cmd := exec.CommandContext(ctx, "cmd", "/C", command)
+			cmd.Dir = filepath.Dir(filePath)
+			
+			output, err := cmd.CombinedOutput()
 			if err != nil {
 				if ctx.Err() == context.DeadlineExceeded {
 					logToFile("RUN_TIMEOUT", fmt.Sprintf("Command timed out: %s", command))
@@ -735,10 +762,10 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 func startWatcher(drivePath string) {
 	fmt.Printf("[SYSTEM] Starting watcher for drive: %s\n", drivePath)
 
-	matcher := loadIgnoreRules() // Load ignore rules
+	matcher := loadIgnoreRules()
 	knownDirs := make(map[string]bool)
 
-	drivePtr, err := windows.UTF16PtrFromString(drivePath) // Convert drive path to UTF16 pointer
+	drivePtr, err := windows.UTF16PtrFromString(drivePath)
 	if err != nil {
 		fmt.Printf("[ERROR] Creating UTF16 pointer for %s: %v\n", drivePath, err)
 		return
@@ -752,14 +779,15 @@ func startWatcher(drivePath string) {
 		windows.OPEN_EXISTING,
 		windows.FILE_FLAG_BACKUP_SEMANTICS,
 		0,
-	) // Open directory handle for monitoring
+	)
 	if err != nil {
 		fmt.Printf("[ERROR] Opening directory %s: %v\n", drivePath, err)
 		return
 	}
-	defer windows.CloseHandle(handle) // Close handle on exit
+	defer windows.CloseHandle(handle)
 
-	buffer := make([]byte, 1024*1024) // Allocate 1MB notification buffer
+	// Буфер 1МБ для предотвращения пропуска событий
+	buffer := make([]byte, 1024*1024)
 	var oldFullPath string
 	var oldIsDir bool
 
@@ -781,7 +809,7 @@ func startWatcher(drivePath string) {
 			&bytesReturned,
 			nil,
 			0,
-		) // Read directory changes synchronously
+		)
 		if err != nil {
 			fmt.Printf("[ERROR] Reading directory changes on %s: %v\n", drivePath, err)
 			time.Sleep(1 * time.Second)
@@ -798,13 +826,13 @@ func startWatcher(drivePath string) {
 				break
 			}
 
-			info := (*windows.FileNotifyInformation)(unsafe.Pointer(&buffer[offset])) // Parse notification entry
+			info := (*windows.FileNotifyInformation)(unsafe.Pointer(&buffer[offset]))
 
 			if info.FileNameLength == 0 || info.FileNameLength > 1024 {
 				break
 			}
 
-			fileName := windows.UTF16ToString((*[1024]uint16)(unsafe.Pointer(&info.FileName))[0 : info.FileNameLength/2]) // Extract filename
+			fileName := windows.UTF16ToString((*[1024]uint16)(unsafe.Pointer(&info.FileName))[0 : info.FileNameLength/2])
 
 			if fileName == "" {
 				if info.NextEntryOffset == 0 {
@@ -824,9 +852,9 @@ func startWatcher(drivePath string) {
 				continue
 			}
 
-			fullPath := filepath.Join(drivePath, fileName) // Construct full file path
+			fullPath := filepath.Join(drivePath, fileName)
 
-			fi, statErr := os.Stat(fullPath) // Stat file path
+			fi, statErr := os.Stat(fullPath)
 			isDir := statErr == nil && fi.IsDir()
 
 			switch info.Action {
@@ -899,7 +927,7 @@ func startWatcher(drivePath string) {
 						msg = fmt.Sprintf("ren file %s %s", oldFullPath, newBase)
 					}
 					
-					go executeRules(fullPath, info.Action, isDir, oldFullPath, oldIsDir) // Run rules asynchronously
+					go executeRules(fullPath, info.Action, isDir, oldFullPath, oldIsDir)
 					
 					oldFullPath = ""
 					oldIsDir = false
@@ -913,10 +941,10 @@ func startWatcher(drivePath string) {
 			}
 
 			if msg != "" {
-				printColoredEvent(info.Action, isDir, msg) // Print console log
+				printColoredEvent(info.Action, isDir, msg)
 
 				if info.Action != windows.FILE_ACTION_RENAMED_NEW_NAME {
-					go executeRules(fullPath, info.Action, isDir, "", false) // Run rules asynchronously
+					go executeRules(fullPath, info.Action, isDir, "", false)
 				}
 
 				if info.Action == windows.FILE_ACTION_REMOVED && isDir {
@@ -936,7 +964,7 @@ func startWatcher(drivePath string) {
 //Retrieves all local fixed and removable drives
 func getLocalDrives() []string {
 	var drives []string
-	bitmask, err := windows.GetLogicalDrives() // Get logical drive bitmask
+	bitmask, err := windows.GetLogicalDrives()
 	if err != nil {
 		return drives
 	}
@@ -944,7 +972,7 @@ func getLocalDrives() []string {
 	for i := 0; i < 26; i++ {
 		if bitmask&(1<<i) != 0 {
 			drive := string(rune('A'+i)) + ":\\"
-			driveType := windows.GetDriveType(syscall.StringToUTF16Ptr(drive)) // Get drive type
+			driveType := windows.GetDriveType(syscall.StringToUTF16Ptr(drive))
 			if driveType == windows.DRIVE_FIXED || driveType == windows.DRIVE_REMOVABLE {
 				drives = append(drives, drive)
 			}
@@ -956,9 +984,9 @@ func getLocalDrives() []string {
 //________________________________________________________
 //Executes cleanup logic on terminal exit
 func onExit() {
-	ftpMutex.Lock() // Lock FTP mutex
+	ftpMutex.Lock()
 	for url, conn := range ftpConns {
-		conn.Conn.Quit() // Quit FTP connection
+		conn.Conn.Quit()
 		fmt.Printf("[SYSTEM] FTP disconnected: %s\n", url)
 	}
 	ftpMutex.Unlock()
@@ -972,7 +1000,7 @@ func main() {
 	if len(os.Args) > 1 {
 		arg := os.Args[1]
 		if arg == "*" {
-			drivesToWatch = getLocalDrives() // Watch all local drives
+			drivesToWatch = getLocalDrives()
 		} else {
 			arg = strings.TrimSuffix(arg, ":")
 			arg = strings.TrimSuffix(arg, "\\")
@@ -983,7 +1011,7 @@ func main() {
 				fmt.Printf("[ERROR] Drive %s not found.\n", drive)
 				os.Exit(1)
 			}
-			drivesToWatch = append(drivesToWatch, drive) // Watch specified drive
+			drivesToWatch = append(drivesToWatch, drive)
 		}
 	} else {
 		exePath, err := os.Executable()
@@ -996,7 +1024,7 @@ func main() {
 			vol = "C:"
 		}
 		drive := vol + "\\"
-		drivesToWatch = append(drivesToWatch, drive) // Watch current drive by default
+		drivesToWatch = append(drivesToWatch, drive)
 	}
 
 	if len(drivesToWatch) == 0 {
@@ -1005,7 +1033,7 @@ func main() {
 	}
 
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM) // Trap termination signals
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
 		fmt.Println("\n[SYSTEM] Shutting down...")
@@ -1018,10 +1046,10 @@ func main() {
 		wg.Add(1)
 		go func(d string) {
 			defer wg.Done()
-			startWatcher(d) // Start watcher for each drive
+			startWatcher(d)
 		}(drive)
 	}
 
 	fmt.Println("[SYSTEM] Application is running. Press Ctrl+C to exit.")
-	wg.Wait() // Wait for all watchers
+	wg.Wait()
 }
