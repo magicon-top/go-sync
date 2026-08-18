@@ -19,16 +19,16 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-type EventLog struct {
-	Text       string
-	ActionType uint32
-	IsDir      bool
-}
-
 type SyncRule struct {
 	Pattern string
 	Action  string
 	Target  string
+}
+
+type CachedRules struct {
+	ModTime time.Time
+	Size    int64
+	Rules   []SyncRule
 }
 
 type FTPConnection struct {
@@ -37,11 +37,12 @@ type FTPConnection struct {
 }
 
 var (
-	syncRules      []SyncRule
-	syncRulesMutex sync.RWMutex
-	ftpConns       = make(map[string]*FTPConnection)
-	ftpMutex       sync.Mutex
-	logMutex       sync.Mutex
+	ftpConns   = make(map[string]*FTPConnection)
+	ftpMutex   sync.Mutex
+	logMutex   sync.Mutex
+
+	ruleCache      = make(map[string]CachedRules)
+	ruleCacheMutex sync.Mutex
 )
 
 func init() {
@@ -150,28 +151,18 @@ func loadIgnoreRules() ignore.IgnoreMatcher {
 }
 
 //________________________________________________________
-//Load sync rules from go-sync.txt
-func loadSyncRules() []SyncRule {
-	var rules []SyncRule
-
-	exePath, err := os.Executable()
+//Parses .go-sync.txt and converts relative patterns to absolute based on config directory
+func parseSyncFile(filePath, configDir string) ([]SyncRule, error) {
+	file, err := os.Open(filePath)
 	if err != nil {
-		return rules
-	}
-
-	rulesPath := filepath.Join(filepath.Dir(exePath), "go-sync.txt")
-	file, err := os.Open(rulesPath)
-	if err != nil {
-		fmt.Printf("No go-sync.txt found: %v\n", err)
-		return rules
+		return nil, err
 	}
 	defer file.Close()
 
+	var rules []SyncRule
 	scanner := bufio.NewScanner(file)
-	lineNum := 0
 
 	for scanner.Scan() {
-		lineNum++
 		line := strings.TrimSpace(scanner.Text())
 
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -180,20 +171,26 @@ func loadSyncRules() []SyncRule {
 
 		parts := strings.SplitN(line, ";", 2)
 		if len(parts) != 2 {
-			fmt.Printf("Invalid rule at line %d: %s\n", lineNum, line)
 			continue
 		}
 
-		pattern := strings.TrimSpace(parts[0])
+		rawPattern := strings.TrimSpace(parts[0])
 		action := strings.TrimSpace(parts[1])
 
-		if pattern == "" || action == "" {
-			fmt.Printf("Empty pattern or action at line %d\n", lineNum)
+		if rawPattern == "" || action == "" {
 			continue
+		}
+
+		// Prepend configDir to make the relative pattern absolute for matching
+		var absPattern string
+		if filepath.IsAbs(rawPattern) {
+			absPattern = rawPattern
+		} else {
+			absPattern = filepath.Join(configDir, rawPattern)
 		}
 
 		rule := SyncRule{
-			Pattern: pattern,
+			Pattern: absPattern,
 		}
 
 		if strings.HasPrefix(action, "<> ftp://") {
@@ -216,7 +213,64 @@ func loadSyncRules() []SyncRule {
 		rules = append(rules, rule)
 	}
 
-	return rules
+	return rules, nil
+}
+
+//________________________________________________________
+//Loads rules from .go-sync.txt with caching based on ModTime and Size
+func loadRulesCached(configPath string, configDir string) ([]SyncRule, error) {
+	fi, err := os.Stat(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	ruleCacheMutex.Lock()
+	defer ruleCacheMutex.Unlock()
+
+	cached, exists := ruleCache[configPath]
+	if exists && cached.ModTime.Equal(fi.ModTime()) && cached.Size == fi.Size() {
+		return cached.Rules, nil
+	}
+
+	rules, err := parseSyncFile(configPath, configDir)
+	if err != nil {
+		return nil, err
+	}
+
+	ruleCache[configPath] = CachedRules{
+		ModTime: fi.ModTime(),
+		Size:    fi.Size(),
+		Rules:   rules,
+	}
+	return rules, nil
+}
+
+//________________________________________________________
+//Traverses up from file's directory to drive root, collecting all .go-sync.txt rules
+func getRulesForPath(filePath string) []SyncRule {
+	var allRules []SyncRule
+
+	dir := filepath.Dir(filePath)
+	drive := filepath.VolumeName(dir) + "\\"
+	if drive == "\\" || drive == "" {
+		drive = "D:\\"
+	}
+
+	curr := dir
+	for {
+		configPath := filepath.Join(curr, ".go-sync.txt")
+		if rules, err := loadRulesCached(configPath, curr); err == nil {
+			allRules = append(allRules, rules...)
+		}
+
+		parent := filepath.Dir(curr)
+		if parent == curr || len(curr) <= len(drive) {
+			break
+		}
+		curr = parent
+	}
+
+	return allRules
 }
 
 //________________________________________________________
@@ -253,8 +307,6 @@ func parseFTPURL(url string) (host, user, pass, path string, err error) {
 			user = auth
 		}
 		hostPart = host
-	} else {
-		hostPart = hostPart
 	}
 
 	host = hostPart
@@ -359,7 +411,7 @@ func doUploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 	if fi.IsDir() {
 		err = ftpConn.Conn.MakeDir(remotePath)
 		if err != nil {
-			// Suppressing MakeDir error, it usually means dir exists
+			// Ignore if exists
 		}
 		logToFile("FTP_MKDIR", fmt.Sprintf("%s -> ftp://%s/%s", localPath, host, remotePath))
 		return nil
@@ -476,48 +528,6 @@ func removeFTPDirectory(conn *ftp.ServerConn, path string) error {
 }
 
 //________________________________________________________
-//Watch for changes in go-sync.txt
-func watchSyncFile() {
-	exePath, err := os.Executable()
-	if err != nil {
-		return
-	}
-
-	syncFilePath := filepath.Join(filepath.Dir(exePath), "go-sync.txt")
-
-	var lastModTime time.Time
-	var lastSize int64
-
-	if fi, err := os.Stat(syncFilePath); err == nil {
-		lastModTime = fi.ModTime()
-		lastSize = fi.Size()
-	}
-
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		fi, err := os.Stat(syncFilePath)
-		if err != nil {
-			continue
-		}
-
-		if !fi.ModTime().Equal(lastModTime) || fi.Size() != lastSize {
-			newRules := loadSyncRules()
-			if len(newRules) > 0 || len(syncRules) > 0 {
-				syncRulesMutex.Lock()
-				syncRules = newRules
-				syncRulesMutex.Unlock()
-				fmt.Printf("\n[SYSTEM] Reloaded %d sync rules from go-sync.txt\n", len(syncRules))
-			}
-
-			lastModTime = fi.ModTime()
-			lastSize = fi.Size()
-		}
-	}
-}
-
-//________________________________________________________
 //Check if path matches pattern
 func matchPattern(pattern, path string) bool {
 	pattern = strings.ReplaceAll(pattern, "/", "\\")
@@ -611,14 +621,14 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 }
 
 //________________________________________________________
-//Execute sync rules for an event (safe to run concurrently)
+//Execute sync rules dynamically found from .go-sync.txt hierarchy
 func executeRules(filePath string, action uint32, isDir bool, oldPath string, oldIsDir bool) {
-	syncRulesMutex.RLock()
-	rulesCopy := make([]SyncRule, len(syncRules))
-	copy(rulesCopy, syncRules)
-	syncRulesMutex.RUnlock()
+	rules := getRulesForPath(filePath)
+	if len(rules) == 0 {
+		return
+	}
 
-	for _, rule := range rulesCopy {
+	for _, rule := range rules {
 		if !matchPattern(rule.Pattern, filePath) {
 			continue
 		}
@@ -701,7 +711,6 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 
 			logToFile("RUN_COMMAND", command)
 
-			// Timeout for external commands to prevent blocking goroutines indefinitely
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
 
@@ -751,7 +760,6 @@ func startWatcher(drivePath string) {
 	}
 	defer windows.CloseHandle(handle)
 
-	// Increased buffer size to 1MB to prevent ERROR_NOTIFY_ENUM_DIR during massive file changes
 	buffer := make([]byte, 1024*1024)
 	var oldFullPath string
 	var oldIsDir bool
@@ -892,7 +900,6 @@ func startWatcher(drivePath string) {
 						msg = fmt.Sprintf("ren file %s %s", oldFullPath, newBase)
 					}
 					
-					// Run executeRules concurrently so event loop doesn't block
 					go executeRules(fullPath, info.Action, isDir, oldFullPath, oldIsDir)
 					
 					oldFullPath = ""
@@ -910,7 +917,6 @@ func startWatcher(drivePath string) {
 				printColoredEvent(info.Action, isDir, msg)
 
 				if info.Action != windows.FILE_ACTION_RENAMED_NEW_NAME {
-					// Run executeRules concurrently so event loop doesn't block
 					go executeRules(fullPath, info.Action, isDir, "", false)
 				}
 
@@ -999,9 +1005,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	syncRules = loadSyncRules()
-	fmt.Printf("[SYSTEM] Loaded %d initial sync rules\n", len(syncRules))
-
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -1010,8 +1013,6 @@ func main() {
 		onExit()
 		os.Exit(0)
 	}()
-
-	go watchSyncFile()
 
 	var wg sync.WaitGroup
 	for _, drive := range drivesToWatch {
