@@ -15,21 +15,26 @@ import (
 	"unsafe"
 
 	"github.com/jlaffaye/ftp"
-	ignore "github.com/monochromegane/go-gitignore"
 	"golang.org/x/sys/windows"
 )
 
 type SyncRule struct {
-	BaseDir string // Directory where .go-sync.txt was found
+	BaseDir string // Directory where .autorun was found
 	Pattern string // Clean pattern without base path
 	Action  string // Action to perform
 	Target  string // Target path or command
 }
 
 type CachedRules struct {
-	ModTime time.Time // Modification time of the config file
-	Size    int64     // Size of the config file
+	ModTime time.Time  // Modification time of the config file
+	Size    int64      // Size of the config file
 	Rules   []SyncRule // Parsed rules
+}
+
+type CachedIgnore struct {
+	ModTime  time.Time // Modification time of the ignore file
+	Size     int64     // Size of the ignore file
+	Patterns []string  // Parsed ignore patterns
 }
 
 type FTPConnection struct {
@@ -43,6 +48,8 @@ var (
 	logMutex       sync.Mutex                        // Mutex for log file
 	ruleCache      = make(map[string]CachedRules)    // Cache for parsed rules
 	ruleCacheMutex sync.Mutex                        // Mutex for rules cache
+	ignoreCache    = make(map[string]CachedIgnore)   // Cache for ignore patterns
+	ignoreMutex    sync.Mutex                        // Mutex for ignore cache
 )
 
 func init() {
@@ -99,8 +106,6 @@ func printColoredEvent(action uint32, isDir bool, text string) {
 
 //________________________________________________________
 //Writes log entries with size check and rotation at 50MB
-//________________________________________________________
-//Writes log entries with size check and rotation at 50MB
 func logToFile(opType, detail string) {
 	logMutex.Lock()         // Lock log file
 	defer logMutex.Unlock() // Unlock log file on exit
@@ -112,13 +117,6 @@ func logToFile(opType, detail string) {
 	}
 
 	exeDir := filepath.Dir(exePath) // Get executable directory
-	
-	// Alternative: use working directory instead of executable directory
-	// workDir, err := os.Getwd()
-	// if err != nil {
-	//     return
-	// }
-	// exeDir = workDir
 	
 	logPath := filepath.Join(exeDir, "go-sync.log") // Construct log file path
 	oldLogPath := filepath.Join(exeDir, "go-sync_old.log") // Construct old log file path
@@ -140,28 +138,167 @@ func logToFile(opType, detail string) {
 	logEntry := fmt.Sprintf("[%s] %s | %s\n", timestamp, opType, detail) // Format log entry
 	file.WriteString(logEntry) // Write to file
 }
+
 //________________________________________________________
-//Loads .watchignore rules from file near executable
-func loadIgnoreRules() ignore.IgnoreMatcher {
-	exePath, err := os.Executable() // Get executable path
-	var ignorePath string           // Path to ignore file
-
-	if err == nil {
-		ignorePath = filepath.Join(filepath.Dir(exePath), ".watchignore") // Use absolute path
-	} else {
-		ignorePath = ".watchignore" // Use relative path as fallback
-	}
-
-	matcher, err := ignore.NewGitIgnore(ignorePath) // Create matcher
+//Load .autoignore patterns with caching
+func loadIgnoreRulesCached(ignorePath string, configDir string) ([]string, error) {
+	fi, err := os.Stat(ignorePath) // Get file stats
 	if err != nil {
-		return nil // Return nil if file not found
+		return nil, err // Return on error
 	}
 
-	return matcher // Return initialized matcher
+	ignoreMutex.Lock()         // Lock ignore cache mutex
+	defer ignoreMutex.Unlock() // Unlock ignore cache mutex on exit
+
+	cached, exists := ignoreCache[ignorePath] // Try to get cached patterns
+	if exists && cached.ModTime.Equal(fi.ModTime()) && cached.Size == fi.Size() { // Check if unchanged
+		return cached.Patterns, nil // Return cached patterns
+	}
+
+	// Read patterns from file
+	file, err := os.Open(ignorePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var patterns []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" && !strings.HasPrefix(line, "#") {
+			patterns = append(patterns, line)
+		}
+	}
+
+	ignoreCache[ignorePath] = CachedIgnore{
+		ModTime:  fi.ModTime(), // Update ModTime
+		Size:     fi.Size(),    // Update Size
+		Patterns: patterns,     // Update Patterns
+	}
+	return patterns, nil // Return new patterns
 }
 
 //________________________________________________________
-//Parses .go-sync.txt and creates rules
+//Check if path matches any ignore pattern
+func isPathIgnored(filePath string, configDir string) bool {
+	ignorePath := filepath.Join(configDir, ".autoignore")
+	
+	// Check if .autoignore exists
+	if _, err := os.Stat(ignorePath); os.IsNotExist(err) {
+		return false
+	}
+	
+	patterns, err := loadIgnoreRulesCached(ignorePath, configDir)
+	if err != nil {
+		return false
+	}
+
+	relPath, err := filepath.Rel(configDir, filePath)
+	if err != nil {
+		return false
+	}
+	
+	// Convert to forward slashes for consistency
+	relPath = filepath.ToSlash(relPath)
+	fileName := filepath.Base(relPath)
+	
+	for _, pattern := range patterns {
+		pattern = strings.TrimSpace(pattern)
+		if pattern == "" {
+			continue
+		}
+		
+		// Normalize pattern
+		pattern = strings.ReplaceAll(pattern, "\\", "/")
+		pattern = strings.TrimSuffix(pattern, "/")
+		
+		matched := false
+		
+		// Handle different pattern types
+		if strings.HasPrefix(pattern, "**/") {
+			// Match in any directory
+			subPattern := strings.TrimPrefix(pattern, "**/")
+			matched, _ = filepath.Match(subPattern, fileName)
+			if !matched {
+				matched, _ = filepath.Match(subPattern, relPath)
+			}
+			// Also try matching directories in path
+			if !matched {
+				pathParts := strings.Split(relPath, "/")
+				for _, part := range pathParts {
+					if m, _ := filepath.Match(subPattern, part); m {
+						matched = true
+						break
+					}
+				}
+			}
+		} else if strings.Contains(pattern, "/") {
+			// Directory or path-specific pattern
+			patternClean := strings.TrimSuffix(pattern, "/")
+			
+			// Check if pattern matches the full relative path
+			matched, _ = filepath.Match(patternClean, relPath)
+			
+			// Check if pattern matches any directory in the path
+			if !matched {
+				pathParts := strings.Split(relPath, "/")
+				for i, part := range pathParts {
+					if m, _ := filepath.Match(patternClean, part); m {
+						matched = true
+						break
+					}
+					// Check if this directory and all subdirectories should be ignored
+					if i < len(pathParts)-1 {
+						subPath := strings.Join(pathParts[:i+1], "/")
+						if m, _ := filepath.Match(patternClean, subPath); m {
+							matched = true
+							break
+						}
+					}
+				}
+			}
+			
+			// Check if file is inside ignored directory
+			if !matched {
+				pathParts := strings.Split(relPath, "/")
+				for i := 0; i < len(pathParts); i++ {
+					subPath := strings.Join(pathParts[:i+1], "/")
+					if m, _ := filepath.Match(patternClean, subPath); m {
+						matched = true
+						break
+					}
+				}
+			}
+		} else {
+			// File pattern (like *.tmp)
+			matched, _ = filepath.Match(pattern, fileName)
+			if !matched {
+				matched, _ = filepath.Match(pattern, relPath)
+			}
+			// Check if pattern matches any part of the path
+			if !matched {
+				pathParts := strings.Split(relPath, "/")
+				for _, part := range pathParts {
+					if m, _ := filepath.Match(pattern, part); m {
+						matched = true
+						break
+					}
+				}
+			}
+		}
+		
+		if matched {
+			fmt.Printf("[SKIP] Ignored by pattern '%s': %s\n", pattern, filePath)
+			return true
+		}
+	}
+	
+	return false
+}
+
+//________________________________________________________
+//Parses .autorun and creates rules
 func parseSyncFile(filePath, configDir string) ([]SyncRule, error) {
 	file, err := os.Open(filePath) // Open config file
 	if err != nil {
@@ -231,7 +368,7 @@ func parseSyncFile(filePath, configDir string) ([]SyncRule, error) {
 }
 
 //________________________________________________________
-//Loads rules from .go-sync.txt with caching based on ModTime and Size
+//Loads rules from .autorun with caching based on ModTime and Size
 func loadRulesCached(configPath string, configDir string) ([]SyncRule, error) {
 	fi, err := os.Stat(configPath) // Get file stats
 	if err != nil {
@@ -260,7 +397,7 @@ func loadRulesCached(configPath string, configDir string) ([]SyncRule, error) {
 }
 
 //________________________________________________________
-//Traverses up from file's directory to drive root, collecting all .go-sync.txt rules
+//Traverses up from file's directory to drive root, collecting all .autorun rules
 func getRulesForPath(filePath string) []SyncRule {
 	var allRules []SyncRule // Slice for all rules
 
@@ -272,7 +409,7 @@ func getRulesForPath(filePath string) []SyncRule {
 
 	curr := dir // Current directory pointer
 	for {
-		configPath := filepath.Join(curr, ".go-sync.txt") // Construct config path
+		configPath := filepath.Join(curr, ".autorun") // Construct config path
 		if rules, err := loadRulesCached(configPath, curr); err == nil { // Load rules
 			allRules = append(allRules, rules...) // Append to all rules
 		}
@@ -542,7 +679,7 @@ func removeFTPDirectory(conn *ftp.ServerConn, path string) error {
 }
 
 //________________________________________________________
-//Check if path matches standard gitignore-like inclusion pattern
+//Check if path matches pattern
 func matchPattern(rule SyncRule, fullPath string) bool {
 	baseDir := strings.ToLower(filepath.Clean(rule.BaseDir)) // Clean and lower BaseDir
 	pathLower := strings.ToLower(filepath.Clean(fullPath))   // Clean and lower full path
@@ -666,7 +803,7 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 }
 
 //________________________________________________________
-//Execute sync rules dynamically found from .go-sync.txt hierarchy
+//Execute sync rules dynamically found from .autorun hierarchy
 func executeRules(filePath string, action uint32, isDir bool, oldPath string, oldIsDir bool) {
 	rules := getRulesForPath(filePath) // Gather rules dynamically
 	if len(rules) == 0 {
@@ -676,6 +813,11 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 	for _, rule := range rules { // Iterate matched rules
 		if !matchPattern(rule, filePath) { // Check relative path against BaseDir
 			continue // Skip if not matched
+		}
+
+		// Check if path is ignored by .autoignore
+		if isPathIgnored(filePath, rule.BaseDir) {
+			continue // Skip if ignored
 		}
 
 		switch rule.Action {
@@ -781,7 +923,6 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 func startWatcher(drivePath string) {
 	fmt.Printf("[SYSTEM] Starting watcher for drive: %s\n", drivePath) // Print startup info
 
-	matcher := loadIgnoreRules() // Load ignore rules
 	knownDirs := make(map[string]bool) // Known directories map
 
 	drivePtr, err := windows.UTF16PtrFromString(drivePath) // Convert drive path to pointer
@@ -865,16 +1006,6 @@ func startWatcher(drivePath string) {
 			fileName := windows.UTF16ToString((*[1024]uint16)(unsafe.Pointer(&info.FileName))[0 : info.FileNameLength/2]) // Extract filename
 
 			if fileName == "" { // Check if empty
-				if info.NextEntryOffset == 0 { // Check next offset
-					break // Break inner loop
-				}
-				offset += info.NextEntryOffset // Increment offset
-				continue // Continue inner loop
-			}
-
-			normalizedPath := strings.ReplaceAll(fileName, "\\", "/") // Normalize slashes for matcher
-
-			if matcher != nil && matcher.Match(normalizedPath, false) { // Apply ignore rules
 				if info.NextEntryOffset == 0 { // Check next offset
 					break // Break inner loop
 				}
