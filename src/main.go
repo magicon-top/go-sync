@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -58,8 +59,6 @@ func enableVirtualTerminalProcessing() {
 
 //________________________________________________________
 //Prints colored event string to the console
-//________________________________________________________
-//Prints colored event string to the console
 func printColoredEvent(action uint32, isDir bool, text string) {
 	var colorCode string
 	reset := "\033[0m"
@@ -100,10 +99,10 @@ func printColoredEvent(action uint32, isDir bool, text string) {
 //________________________________________________________
 //Writes log entries with size check and rotation at 50MB
 func logToFile(opType, detail string) {
-	logMutex.Lock() // Ensure thread-safe log access
+	logMutex.Lock()
 	defer logMutex.Unlock()
 
-	exePath, err := os.Executable() // Get current executable directory
+	exePath, err := os.Executable()
 	if err != nil {
 		return
 	}
@@ -112,22 +111,22 @@ func logToFile(opType, detail string) {
 	logPath := filepath.Join(exeDir, "go-sync.log")
 	oldLogPath := filepath.Join(exeDir, "go-sync_old.log")
 
-	if fi, err := os.Stat(logPath); err == nil { // Check log file size
-		if fi.Size() >= 50*1024*1024 { // Rotate if size >= 50MB
-			os.Remove(oldLogPath)          // Delete previous backup log
-			os.Rename(logPath, oldLogPath) // Copy current log to backup
+	if fi, err := os.Stat(logPath); err == nil {
+		if fi.Size() >= 50*1024*1024 {
+			os.Remove(oldLogPath)
+			os.Rename(logPath, oldLogPath)
 		}
 	}
 
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644) // Open log file
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return
 	}
 	defer file.Close()
 
-	timestamp := time.Now().Format("2006-01-02 15:04:05")                // Format current timestamp
-	logEntry := fmt.Sprintf("[%s] %s | %s\n", timestamp, opType, detail) // Format full log entry
-	file.WriteString(logEntry)                                           // Append log entry to file
+	timestamp := time.Now().Format("2006-01-02 15:04:05")
+	logEntry := fmt.Sprintf("[%s] %s | %s\n", timestamp, opType, detail)
+	file.WriteString(logEntry)
 }
 
 //________________________________________________________
@@ -306,8 +305,35 @@ func getFTPConnection(ftpURL string) (*FTPConnection, error) {
 }
 
 //________________________________________________________
-//Upload file or directory to FTP
+//Force closes and removes FTP connection from cache
+func forceCloseFTP(ftpURL string) {
+	ftpMutex.Lock()
+	defer ftpMutex.Unlock()
+	if conn, exists := ftpConns[ftpURL]; exists {
+		conn.Conn.Quit()
+		delete(ftpConns, ftpURL)
+	}
+}
+
+//________________________________________________________
+//Upload wrapper with retry mechanism
 func uploadToFTP(localPath, ftpURL string, rule SyncRule) error {
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		err = doUploadToFTP(localPath, ftpURL, rule)
+		if err == nil {
+			return nil
+		}
+		fmt.Printf("[ERROR] FTP upload attempt %d failed: %v\n", attempt, err)
+		forceCloseFTP(ftpURL)
+		time.Sleep(1 * time.Second)
+	}
+	return err
+}
+
+//________________________________________________________
+//Core upload file or directory to FTP logic
+func doUploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 	ftpConn, err := getFTPConnection(ftpURL)
 	if err != nil {
 		return err
@@ -322,7 +348,6 @@ func uploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 	}
 
 	relPath := getTargetPath(localPath, rule)
-
 	remotePath := filepath.ToSlash(filepath.Join(ftpPath, relPath))
 	remotePath = strings.TrimPrefix(remotePath, "/")
 
@@ -336,7 +361,7 @@ func uploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 		if err != nil {
 			// Suppressing MakeDir error, it usually means dir exists
 		}
-		logToFile("FTP_MKDIR", fmt.Sprintf("%s -> ftp://%s/%s", localPath, host, remotePath)) // Log FTP directory creation
+		logToFile("FTP_MKDIR", fmt.Sprintf("%s -> ftp://%s/%s", localPath, host, remotePath))
 		return nil
 	}
 
@@ -361,13 +386,29 @@ func uploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 		return fmt.Errorf("FTP upload error: %v", err)
 	}
 
-	logToFile("FTP_UPLOAD", fmt.Sprintf("%s -> ftp://%s/%s", localPath, host, remotePath)) // Log FTP upload operation
+	logToFile("FTP_UPLOAD", fmt.Sprintf("%s -> ftp://%s/%s", localPath, host, remotePath))
 	return nil
 }
 
 //________________________________________________________
-//Delete file or directory from FTP
+//Delete wrapper with retry mechanism
 func deleteFromFTP(localPath, ftpURL string, rule SyncRule, isDir bool) error {
+	var err error
+	for attempt := 1; attempt <= 3; attempt++ {
+		err = doDeleteFromFTP(localPath, ftpURL, rule, isDir)
+		if err == nil {
+			return nil
+		}
+		fmt.Printf("[ERROR] FTP delete attempt %d failed: %v\n", attempt, err)
+		forceCloseFTP(ftpURL)
+		time.Sleep(1 * time.Second)
+	}
+	return err
+}
+
+//________________________________________________________
+//Core delete file or directory from FTP logic
+func doDeleteFromFTP(localPath, ftpURL string, rule SyncRule, isDir bool) error {
 	ftpConn, err := getFTPConnection(ftpURL)
 	if err != nil {
 		return err
@@ -390,13 +431,13 @@ func deleteFromFTP(localPath, ftpURL string, rule SyncRule, isDir bool) error {
 		if err != nil {
 			return fmt.Errorf("FTP delete directory error: %v", err)
 		}
-		logToFile("FTP_RMDIR", fmt.Sprintf("ftp://%s/%s", host, remotePath)) // Log FTP directory deletion
+		logToFile("FTP_RMDIR", fmt.Sprintf("ftp://%s/%s", host, remotePath))
 	} else {
 		err = ftpConn.Conn.Delete(remotePath)
 		if err != nil {
 			return fmt.Errorf("FTP delete error: %v", err)
 		}
-		logToFile("FTP_DELETE", fmt.Sprintf("ftp://%s/%s", host, remotePath)) // Log FTP file deletion
+		logToFile("FTP_DELETE", fmt.Sprintf("ftp://%s/%s", host, remotePath))
 	}
 
 	return nil
@@ -550,7 +591,7 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 
 	if fi.IsDir() {
 		os.MkdirAll(destPath, 0755)
-		logToFile("MKDIR", destPath) // Log local directory creation
+		logToFile("MKDIR", destPath)
 		return
 	}
 
@@ -566,11 +607,11 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 		return
 	}
 
-	logToFile("COPY", fmt.Sprintf("%s -> %s", srcPath, destPath)) // Log copy operation
+	logToFile("COPY", fmt.Sprintf("%s -> %s", srcPath, destPath))
 }
 
 //________________________________________________________
-//Execute sync rules for an event
+//Execute sync rules for an event (safe to run concurrently)
 func executeRules(filePath string, action uint32, isDir bool, oldPath string, oldIsDir bool) {
 	syncRulesMutex.RLock()
 	rulesCopy := make([]SyncRule, len(syncRules))
@@ -591,7 +632,7 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 				oldRelPath := getTargetPath(oldPath, rule)
 				oldTarget := filepath.Join(rule.Target, oldRelPath)
 				os.Remove(oldTarget)
-				logToFile("DELETE", oldTarget) // Log removal of old file after rename
+				logToFile("DELETE", oldTarget)
 			}
 
 		case "sync":
@@ -605,14 +646,14 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 				} else {
 					os.Remove(targetPath)
 				}
-				logToFile("SYNC_DELETE", targetPath) // Log sync deletion
+				logToFile("SYNC_DELETE", targetPath)
 			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
 				oldRelPath := getTargetPath(oldPath, rule)
 				newRelPath := getTargetPath(filePath, rule)
 				oldTarget := filepath.Join(rule.Target, oldRelPath)
 				newTarget := filepath.Join(rule.Target, newRelPath)
 				os.Rename(oldTarget, newTarget)
-				logToFile("SYNC_RENAME", fmt.Sprintf("%s -> %s", oldTarget, newTarget)) // Log sync rename
+				logToFile("SYNC_RENAME", fmt.Sprintf("%s -> %s", oldTarget, newTarget))
 			}
 
 		case "ftp_copy":
@@ -636,21 +677,21 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 		case "run":
 			command := rule.Target
 
-			command = strings.ReplaceAll(command, "$file", filepath.Base(filePath))  // Replace $file with base name
-			command = strings.ReplaceAll(command, "$folder", filepath.Dir(filePath)) // Replace $folder
-			command = strings.ReplaceAll(command, "$name", filepath.Base(filePath))  // Replace $name
-			command = strings.ReplaceAll(command, "$ext", filepath.Ext(filePath))    // Replace $ext
+			command = strings.ReplaceAll(command, "$file", filepath.Base(filePath))
+			command = strings.ReplaceAll(command, "$folder", filepath.Dir(filePath))
+			command = strings.ReplaceAll(command, "$name", filepath.Base(filePath))
+			command = strings.ReplaceAll(command, "$ext", filepath.Ext(filePath))
 
-			eventType := "modify" // Default event string
+			eventType := "modify"
 			switch action {
 			case windows.FILE_ACTION_ADDED:
-				eventType = "new" // File added
+				eventType = "new"
 			case windows.FILE_ACTION_REMOVED:
-				eventType = "del" // File deleted
+				eventType = "del"
 			case windows.FILE_ACTION_RENAMED_OLD_NAME, windows.FILE_ACTION_RENAMED_NEW_NAME:
-				eventType = "rename" // File renamed
+				eventType = "rename"
 			}
-			command = strings.ReplaceAll(command, "$event", eventType) // Replace $event variable
+			command = strings.ReplaceAll(command, "$event", eventType)
 
 			typeStr := "file"
 			if isDir {
@@ -658,11 +699,25 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 			}
 			command = strings.ReplaceAll(command, "$type", typeStr)
 
-			logToFile("RUN_COMMAND", command) // Log executed command
+			logToFile("RUN_COMMAND", command)
 
-			cmd := exec.Command("cmd", "/C", command)
+			// Timeout for external commands to prevent blocking goroutines indefinitely
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, "cmd", "/C", command)
 			cmd.Dir = filepath.Dir(filePath)
-			cmd.CombinedOutput() // Run without blocking UI output
+			
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				if ctx.Err() == context.DeadlineExceeded {
+					logToFile("RUN_TIMEOUT", fmt.Sprintf("Command timed out: %s", command))
+				} else {
+					logToFile("RUN_ERROR", fmt.Sprintf("Error: %v | Command: %s", err, command))
+				}
+			} else if len(output) > 0 {
+				logToFile("RUN_OUTPUT", string(output))
+			}
 		}
 	}
 }
@@ -696,7 +751,8 @@ func startWatcher(drivePath string) {
 	}
 	defer windows.CloseHandle(handle)
 
-	buffer := make([]byte, 65536)
+	// Increased buffer size to 1MB to prevent ERROR_NOTIFY_ENUM_DIR during massive file changes
+	buffer := make([]byte, 1024*1024)
 	var oldFullPath string
 	var oldIsDir bool
 
@@ -774,7 +830,7 @@ func startWatcher(drivePath string) {
 
 			case windows.FILE_ACTION_REMOVED:
 				if knownDirs[fullPath] {
-					isDir = true // Keep in knownDirs so deleteFromFTP knows it was a directory
+					isDir = true
 				}
 
 			case windows.FILE_ACTION_RENAMED_OLD_NAME:
@@ -835,7 +891,10 @@ func startWatcher(drivePath string) {
 					} else {
 						msg = fmt.Sprintf("ren file %s %s", oldFullPath, newBase)
 					}
-					executeRules(fullPath, info.Action, isDir, oldFullPath, oldIsDir)
+					
+					// Run executeRules concurrently so event loop doesn't block
+					go executeRules(fullPath, info.Action, isDir, oldFullPath, oldIsDir)
+					
 					oldFullPath = ""
 					oldIsDir = false
 				} else {
@@ -851,11 +910,12 @@ func startWatcher(drivePath string) {
 				printColoredEvent(info.Action, isDir, msg)
 
 				if info.Action != windows.FILE_ACTION_RENAMED_NEW_NAME {
-					executeRules(fullPath, info.Action, isDir, "", false)
+					// Run executeRules concurrently so event loop doesn't block
+					go executeRules(fullPath, info.Action, isDir, "", false)
 				}
 
 				if info.Action == windows.FILE_ACTION_REMOVED && isDir {
-					delete(knownDirs, fullPath) // Remove from knownDirs after executing rules
+					delete(knownDirs, fullPath)
 				}
 			}
 
@@ -939,11 +999,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Load Initial Sync Rules
 	syncRules = loadSyncRules()
 	fmt.Printf("[SYSTEM] Loaded %d initial sync rules\n", len(syncRules))
 
-	// Setup Graceful Exit
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -953,10 +1011,8 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// Start File Config Watcher
 	go watchSyncFile()
 
-	// Start Drive Watchers
 	var wg sync.WaitGroup
 	for _, drive := range drivesToWatch {
 		wg.Add(1)
