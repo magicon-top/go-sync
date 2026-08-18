@@ -1,0 +1,5 @@
+*.bat
+*.tmp
+*.log
+.git
+.git/
