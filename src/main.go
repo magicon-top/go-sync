@@ -135,7 +135,18 @@ func logToFile(opType, detail string) {
 	defer file.Close() // Close on exit
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05") // Format timestamp
-	logEntry := fmt.Sprintf("[%s] %s | %s\n", timestamp, opType, detail) // Format log entry
+	
+	// Выравнивание opType до 12 символов
+	opTypeAligned := fmt.Sprintf("%-12s", opType)
+	
+	// Выравнивание detail до 50 символов (обрезаем если слишком длинный)
+	detailAligned := detail
+	if len(detail) > 100 {
+		detailAligned = detail[:97] + "..."
+	}
+	
+	// Формат: [timestamp] TYPE         | Detail
+	logEntry := fmt.Sprintf("[%s] %s | %s\n", timestamp, opTypeAligned, detailAligned)
 	file.WriteString(logEntry) // Write to file
 }
 
