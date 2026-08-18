@@ -42,6 +42,17 @@ type FTPConnection struct {
 	Mu   sync.Mutex      // Mutex for thread-safe operations
 }
 
+// Operation tracking for loop prevention
+type OperationTracker struct {
+	mu               sync.Mutex
+	recentOps        map[string]time.Time
+	operationCount   map[string]int
+	chainStart       map[string]time.Time
+	maxOpsPerFile    int
+	dedupWindow      time.Duration
+	chainTimeout     time.Duration
+}
+
 var (
 	ftpConns         = make(map[string]*FTPConnection) // Cache for FTP connections
 	ftpMutex         sync.Mutex                        // Mutex for FTP cache
@@ -50,8 +61,21 @@ var (
 	ruleCacheMutex   sync.Mutex                        // Mutex for rules cache
 	ignoreCache      = make(map[string]CachedIgnore)   // Cache for ignore patterns
 	ignoreMutex      sync.Mutex                        // Mutex for ignore cache
-	operationHistory = make(map[string]time.Time)      // Track recent operations
-	historyMutex     sync.Mutex                        // Mutex for history
+	
+	// Global operation tracker
+	opTracker = &OperationTracker{
+		recentOps:      make(map[string]time.Time),
+		operationCount: make(map[string]int),
+		chainStart:     make(map[string]time.Time),
+		maxOpsPerFile:  10,               // Maximum operations per file
+		dedupWindow:    5 * time.Second,  // Deduplication window
+		chainTimeout:   30 * time.Second, // Chain timeout
+	}
+	
+	// Global chain counter for detecting complex loops
+	globalChainCounter int
+	globalChainMutex   sync.Mutex
+	maxGlobalChain     = 100 // Maximum operations in a chain
 )
 
 func init() {
@@ -154,43 +178,82 @@ func isProtectedFile(fileName string) bool {
 }
 
 //________________________________________________________
-//Check if operation was recently performed
-func isRecentlyProcessed(srcPath, destPath string) bool {
-	historyMutex.Lock()
-	defer historyMutex.Unlock()
+//Check and register operation in global tracker
+func (ot *OperationTracker) checkAndRegister(srcPath, destPath string) bool {
+	ot.mu.Lock()
+	defer ot.mu.Unlock()
 	
+	now := time.Now()
 	key := fmt.Sprintf("%s|%s", strings.ToLower(srcPath), strings.ToLower(destPath))
-	if lastTime, exists := operationHistory[key]; exists {
-		if time.Since(lastTime) < 5*time.Second { // 5 seconds window
-			return true
-		}
-		delete(operationHistory, key) // Clean old entry
-	}
-	return false
-}
-
-//________________________________________________________
-//Mark operation as processed
-func markProcessed(srcPath, destPath string) {
-	historyMutex.Lock()
-	defer historyMutex.Unlock()
 	
-	key := fmt.Sprintf("%s|%s", strings.ToLower(srcPath), strings.ToLower(destPath))
-	operationHistory[key] = time.Now()
-	
-	// Clean old entries periodically
-	if len(operationHistory) > 1000 {
-		now := time.Now()
-		for k, v := range operationHistory {
-			if now.Sub(v) > 10*time.Second {
-				delete(operationHistory, k)
+	// Clean old entries
+	if len(ot.recentOps) > 1000 {
+		for k, v := range ot.recentOps {
+			if now.Sub(v) > ot.dedupWindow {
+				delete(ot.recentOps, k)
+				delete(ot.operationCount, k)
 			}
 		}
 	}
+	
+	// Check if recently processed
+	if lastTime, exists := ot.recentOps[key]; exists {
+		if now.Sub(lastTime) < ot.dedupWindow {
+			return false // Recently processed
+		}
+	}
+	
+	// Check operation count for this file
+	fileKey := strings.ToLower(srcPath)
+	ot.operationCount[fileKey]++
+	if ot.operationCount[fileKey] > ot.maxOpsPerFile {
+		fmt.Printf("[CRITICAL] Operation limit exceeded for: %s\n", srcPath)
+		logToFile("LOOP_PROTECTION", fmt.Sprintf("Operation limit exceeded: %s (count: %d)", 
+			srcPath, ot.operationCount[fileKey]))
+		return false
+	}
+	
+	// Register operation
+	ot.recentOps[key] = now
+	ot.operationCount[key] = ot.operationCount[fileKey]
+	
+	// Reset counter after timeout
+	go func() {
+		time.Sleep(ot.chainTimeout)
+		ot.mu.Lock()
+		delete(ot.operationCount, fileKey)
+		ot.mu.Unlock()
+	}()
+	
+	return true
 }
 
 //________________________________________________________
-//Detect and prevent sync loops
+//Check global chain counter
+func checkGlobalChain() bool {
+	globalChainMutex.Lock()
+	defer globalChainMutex.Unlock()
+	
+	globalChainCounter++
+	if globalChainCounter > maxGlobalChain {
+		fmt.Printf("[CRITICAL] Global chain limit exceeded: %d\n", globalChainCounter)
+		logToFile("LOOP_PROTECTION", fmt.Sprintf("Global chain limit exceeded: %d", globalChainCounter))
+		return false
+	}
+	
+	// Reset counter after timeout
+	go func() {
+		time.Sleep(30 * time.Second)
+		globalChainMutex.Lock()
+		globalChainCounter = 0
+		globalChainMutex.Unlock()
+	}()
+	
+	return true
+}
+
+//________________________________________________________
+//Detect and prevent sync loops (improved version)
 func detectSyncLoop(srcPath string, destPath string) bool {
 	// Normalize paths for comparison
 	srcAbs, err1 := filepath.Abs(srcPath)
@@ -201,6 +264,13 @@ func detectSyncLoop(srcPath string, destPath string) bool {
 	
 	srcAbs = strings.ToLower(filepath.Clean(srcAbs))
 	destAbs = strings.ToLower(filepath.Clean(destAbs))
+	
+	// Direct loop check
+	if srcAbs == destAbs {
+		fmt.Printf("[WARNING] Direct sync loop detected: %s\n", srcPath)
+		logToFile("SYNC_LOOP", fmt.Sprintf("Direct loop: %s -> %s", srcPath, destPath))
+		return true
+	}
 	
 	// Check if destination is inside source directory or vice versa
 	if strings.HasPrefix(destAbs, srcAbs) || strings.HasPrefix(srcAbs, destAbs) {
@@ -213,6 +283,72 @@ func detectSyncLoop(srcPath string, destPath string) bool {
 		}
 	}
 	
+	// Complex chain detection
+	if hasComplexLoop(srcAbs, destAbs) {
+		fmt.Printf("[WARNING] Complex sync loop detected: %s <-> %s\n", srcPath, destPath)
+		logToFile("SYNC_LOOP", fmt.Sprintf("Complex loop: %s -> %s", srcPath, destPath))
+		return true
+	}
+	
+	return false
+}
+
+//________________________________________________________
+//Check for complex sync loops (A->B->C->A)
+func hasComplexLoop(srcPath, destPath string) bool {
+	visited := make(map[string]bool)
+	return checkLoopRecursive(srcPath, destPath, visited, 0)
+}
+
+//________________________________________________________
+//Recursive loop check
+func checkLoopRecursive(src, dest string, visited map[string]bool, depth int) bool {
+	if depth > 10 { // Maximum depth
+		return true // Potential loop
+	}
+	
+	key := strings.ToLower(dest)
+	if visited[key] {
+		return true // Loop found
+	}
+	
+	// Check if we're back to the source
+	if strings.ToLower(src) == key && depth > 0 {
+		return true
+	}
+	
+	visited[key] = true
+	
+	// Get rules for destination directory
+	destDir := dest
+	if fi, err := os.Stat(dest); err == nil && !fi.IsDir() {
+		destDir = filepath.Dir(dest)
+	}
+	
+	rules := getRulesForPath(destDir)
+	for _, rule := range rules {
+		if rule.Action == "sync" || rule.Action == "copy" {
+			// Calculate where this rule would copy to
+			relPath, err := filepath.Rel(rule.BaseDir, src)
+			if err != nil {
+				continue
+			}
+			
+			nextDest := filepath.Join(rule.Target, relPath)
+			nextDestAbs, err := filepath.Abs(nextDest)
+			if err != nil {
+				continue
+			}
+			nextDestAbs = strings.ToLower(filepath.Clean(nextDestAbs))
+			
+			// Recursive check
+			if checkLoopRecursive(src, nextDestAbs, visited, depth+1) {
+				return true
+			}
+		}
+	}
+	
+	delete(visited, key) // Backtrack
 	return false
 }
 
@@ -629,6 +765,11 @@ func forceCloseFTP(ftpURL string) {
 //________________________________________________________
 //Upload wrapper with retry mechanism
 func uploadToFTP(localPath, ftpURL string, rule SyncRule) error {
+	// Check global chain
+	if !checkGlobalChain() {
+		return fmt.Errorf("global chain limit exceeded")
+	}
+	
 	var err error // Error variable
 	for attempt := 1; attempt <= 3; attempt++ { // Retry up to 3 times
 		err = doUploadToFTP(localPath, ftpURL, rule) // Try upload
@@ -704,6 +845,11 @@ func doUploadToFTP(localPath, ftpURL string, rule SyncRule) error {
 //________________________________________________________
 //Delete wrapper with retry mechanism
 func deleteFromFTP(localPath, ftpURL string, rule SyncRule, isDir bool) error {
+	// Check global chain
+	if !checkGlobalChain() {
+		return fmt.Errorf("global chain limit exceeded")
+	}
+	
 	var err error // Error variable
 	for attempt := 1; attempt <= 3; attempt++ { // Retry up to 3 times
 		err = doDeleteFromFTP(localPath, ftpURL, rule, isDir) // Try delete
@@ -869,7 +1015,7 @@ func getTargetPath(srcPath string, rule SyncRule) string {
 }
 
 //________________________________________________________
-//Copy file using rule (preserving directory structure) with loop prevention
+//Copy file using rule (preserving directory structure) with enhanced loop prevention
 func copyFileWithRule(srcPath string, rule SyncRule) {
 	// Check if file is protected
 	if isProtectedFile(filepath.Base(srcPath)) {
@@ -881,14 +1027,19 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 	relPath := getTargetPath(srcPath, rule) // Get relative target path
 	destPath := filepath.Join(rule.Target, relPath) // Construct absolute destination path
 	
-	// Check for sync loop
+	// Check for sync loop (enhanced)
 	if detectSyncLoop(srcPath, destPath) {
 		return // Skip operation
 	}
 	
-	// Check if recently processed
-	if isRecentlyProcessed(srcPath, destPath) {
-		fmt.Printf("[SKIP] Recently processed: %s -> %s\n", srcPath, destPath)
+	// Check global chain counter
+	if !checkGlobalChain() {
+		return // Skip operation
+	}
+	
+	// Check and register operation in tracker
+	if !opTracker.checkAndRegister(srcPath, destPath) {
+		fmt.Printf("[SKIP] Operation blocked by tracker: %s -> %s\n", srcPath, destPath)
 		return
 	}
 	
@@ -900,7 +1051,6 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 	if fi.IsDir() { // If directory
 		os.MkdirAll(destPath, 0755) // Recreate directory structure
 		logToFile("MKDIR", destPath) // Log action
-		markProcessed(srcPath, destPath)
 		return // Exit
 	}
 
@@ -926,9 +1076,6 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 		return // Exit
 	}
 	
-	// Mark operation as processed
-	markProcessed(srcPath, destPath)
-	
 	logToFile("COPY", fmt.Sprintf("%s -> %s", srcPath, destPath)) // Log success
 }
 
@@ -938,6 +1085,11 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 	// Check if file is protected at the beginning
 	if isProtectedFile(filepath.Base(filePath)) {
 		fmt.Printf("[SKIP] Protected file: %s\n", filePath)
+		return
+	}
+	
+	// Check global chain counter
+	if !checkGlobalChain() {
 		return
 	}
 	
@@ -974,40 +1126,63 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string, ol
 			} else if action == windows.FILE_ACTION_REMOVED {
 				relPath := getTargetPath(filePath, rule) // Get relative path
 				targetPath := filepath.Join(rule.Target, relPath) // Construct target
-				if isDir {
-					os.RemoveAll(targetPath) // Remove directory
-				} else {
-					os.Remove(targetPath) // Remove file
+				
+				// Check for loop before delete
+				if !detectSyncLoop(filePath, targetPath) {
+					if isDir {
+						os.RemoveAll(targetPath) // Remove directory
+					} else {
+						os.Remove(targetPath) // Remove file
+					}
+					logToFile("SYNC_DELETE", targetPath) // Log action
 				}
-				logToFile("SYNC_DELETE", targetPath) // Log action
 			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
 				oldRelPath := getTargetPath(oldPath, rule) // Get old relative path
 				newRelPath := getTargetPath(filePath, rule) // Get new relative path
 				oldTarget := filepath.Join(rule.Target, oldRelPath) // Construct old target
 				newTarget := filepath.Join(rule.Target, newRelPath) // Construct new target
-				os.Rename(oldTarget, newTarget) // Rename target
-				logToFile("SYNC_RENAME", fmt.Sprintf("%s -> %s", oldTarget, newTarget)) // Log action
+				
+				// Check for loop before rename
+				if !detectSyncLoop(oldTarget, newTarget) {
+					os.Rename(oldTarget, newTarget) // Rename target
+					logToFile("SYNC_RENAME", fmt.Sprintf("%s -> %s", oldTarget, newTarget)) // Log action
+				}
 			}
 
 		case "ftp_copy":
 			if action == windows.FILE_ACTION_ADDED || action == windows.FILE_ACTION_MODIFIED {
-				uploadToFTP(filePath, rule.Target, rule) // Upload to FTP
+				if opTracker.checkAndRegister(filePath, rule.Target) {
+					uploadToFTP(filePath, rule.Target, rule) // Upload to FTP
+				}
 			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
-				uploadToFTP(filePath, rule.Target, rule) // Upload new file
-				deleteFromFTP(oldPath, rule.Target, rule, oldIsDir) // Delete old from FTP
+				if opTracker.checkAndRegister(filePath, rule.Target) {
+					uploadToFTP(filePath, rule.Target, rule) // Upload new file
+					deleteFromFTP(oldPath, rule.Target, rule, oldIsDir) // Delete old from FTP
+				}
 			}
 
 		case "ftp_sync":
 			if action == windows.FILE_ACTION_ADDED || action == windows.FILE_ACTION_MODIFIED {
-				uploadToFTP(filePath, rule.Target, rule) // Upload to FTP
+				if opTracker.checkAndRegister(filePath, rule.Target) {
+					uploadToFTP(filePath, rule.Target, rule) // Upload to FTP
+				}
 			} else if action == windows.FILE_ACTION_REMOVED {
-				deleteFromFTP(filePath, rule.Target, rule, isDir) // Delete from FTP
+				if opTracker.checkAndRegister(filePath, rule.Target) {
+					deleteFromFTP(filePath, rule.Target, rule, isDir) // Delete from FTP
+				}
 			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
-				uploadToFTP(filePath, rule.Target, rule) // Upload new file
-				deleteFromFTP(oldPath, rule.Target, rule, oldIsDir) // Delete old from FTP
+				if opTracker.checkAndRegister(filePath, rule.Target) {
+					uploadToFTP(filePath, rule.Target, rule) // Upload new file
+					deleteFromFTP(oldPath, rule.Target, rule, oldIsDir) // Delete old from FTP
+				}
 			}
 
 		case "run":
+			// Check if command was recently executed for this file
+			if !opTracker.checkAndRegister(filePath, rule.Target) {
+				continue // Skip if recently executed
+			}
+			
 			command := rule.Target // Get command string
 
 			command = strings.ReplaceAll(command, "$file", filepath.Base(filePath)) // Replace $file
