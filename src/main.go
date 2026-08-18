@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/getlantern/systray"
 	ignore "github.com/monochromegane/go-gitignore"
+	"github.com/jlaffaye/ftp"
 	"golang.org/x/sys/windows"
 )
 
@@ -117,6 +119,11 @@ type SyncRule struct {
 	Target  string
 }
 
+type FTPConnection struct {
+	Conn *ftp.ServerConn
+	Mu   sync.Mutex
+}
+
 var (
 	overlayHwnd uintptr
 	events      []EventLog
@@ -125,6 +132,8 @@ var (
 	knownDirs   = make(map[string]bool)
 	arrowCursor uintptr
 	syncRules   []SyncRule
+	ftpConns    = make(map[string]*FTPConnection)
+	ftpMutex    sync.Mutex
 )
 
 //________________________________________________________
@@ -194,22 +203,245 @@ func loadSyncRules() []SyncRule {
 			Pattern: pattern,
 		}
 		
-		if strings.HasPrefix(action, "->") {
-			rule.Action = "copy"
-			rule.Target = strings.TrimSpace(strings.TrimPrefix(action, "->"))
+		if strings.HasPrefix(action, "<> ftp://") {
+			rule.Action = "ftp_sync"
+			rule.Target = strings.TrimSpace(strings.TrimPrefix(action, "<> "))
+			fmt.Printf("FTP sync rule: %s -> %s\n", pattern, rule.Target)
+		} else if strings.HasPrefix(action, "> ftp://") {
+			rule.Action = "ftp_copy"
+			rule.Target = strings.TrimSpace(strings.TrimPrefix(action, "> "))
+			fmt.Printf("FTP copy rule: %s -> %s\n", pattern, rule.Target)
 		} else if strings.HasPrefix(action, "<>") {
 			rule.Action = "sync"
 			rule.Target = strings.TrimSpace(strings.TrimPrefix(action, "<>"))
+			fmt.Printf("Sync rule: %s -> %s\n", pattern, rule.Target)
+		} else if strings.HasPrefix(action, ">") {
+			rule.Action = "copy"
+			rule.Target = strings.TrimSpace(strings.TrimPrefix(action, ">"))
+			fmt.Printf("Copy rule: %s -> %s\n", pattern, rule.Target)
 		} else {
 			rule.Action = "run"
 			rule.Target = action
+			fmt.Printf("Run rule: %s -> %s\n", pattern, rule.Target)
 		}
 		
 		rules = append(rules, rule)
-		fmt.Printf("Loaded rule: %s ; %s %s\n", pattern, rule.Action, rule.Target)
 	}
 	
 	return rules
+}
+
+//________________________________________________________
+//Parse FTP URL
+func parseFTPURL(url string) (host, user, pass, path string, err error) {
+	if strings.HasPrefix(url, "ftp://") {
+		url = strings.TrimPrefix(url, "ftp://")
+	}
+	
+	parts := strings.SplitN(url, "/", 2)
+	if len(parts) == 0 {
+		return "", "", "", "", fmt.Errorf("invalid FTP URL")
+	}
+	
+	hostPart := parts[0]
+	path = "/"
+	if len(parts) == 2 {
+		path = "/" + parts[1]
+	}
+	
+	user = "anonymous"
+	pass = "anonymous"
+	
+	if strings.Contains(hostPart, "@") {
+		authHost := strings.SplitN(hostPart, "@", 2)
+		auth := authHost[0]
+		host = authHost[1]
+		
+		if strings.Contains(auth, ":") {
+			authParts := strings.SplitN(auth, ":", 2)
+			user = authParts[0]
+			pass = authParts[1]
+		} else {
+			user = auth
+		}
+	} else {
+		host = hostPart
+	}
+	
+	if !strings.Contains(host, ":") {
+		host = host + ":21"
+	}
+	
+	return host, user, pass, path, nil
+}
+
+//________________________________________________________
+//Get or create FTP connection
+func getFTPConnection(ftpURL string) (*FTPConnection, error) {
+	ftpMutex.Lock()
+	defer ftpMutex.Unlock()
+	
+	if conn, exists := ftpConns[ftpURL]; exists {
+		if err := conn.Conn.NoOp(); err == nil {
+			return conn, nil
+		}
+		conn.Conn.Quit()
+		delete(ftpConns, ftpURL)
+	}
+	
+	host, user, pass, _, err := parseFTPURL(ftpURL)
+	if err != nil {
+		return nil, err
+	}
+	
+	conn, err := ftp.Dial(host, ftp.DialWithTimeout(5*time.Second))
+	if err != nil {
+		return nil, fmt.Errorf("FTP dial error: %v", err)
+	}
+	
+	err = conn.Login(user, pass)
+	if err != nil {
+		conn.Quit()
+		return nil, fmt.Errorf("FTP login error: %v", err)
+	}
+	
+	ftpConn := &FTPConnection{
+		Conn: conn,
+	}
+	
+	ftpConns[ftpURL] = ftpConn
+	fmt.Printf("FTP connected to %s\n", host)
+	
+	return ftpConn, nil
+}
+
+//________________________________________________________
+//Upload file or directory to FTP
+func uploadToFTP(localPath, ftpURL string, rule SyncRule) error {
+	ftpConn, err := getFTPConnection(ftpURL)
+	if err != nil {
+		return err
+	}
+	
+	ftpConn.Mu.Lock()
+	defer ftpConn.Mu.Unlock()
+	
+	host, _, _, ftpPath, err := parseFTPURL(ftpURL)
+	if err != nil {
+		return err
+	}
+	
+	relPath := getTargetPath(localPath, rule)
+	
+	remotePath := filepath.ToSlash(filepath.Join(ftpPath, relPath))
+	remotePath = strings.TrimPrefix(remotePath, "/")
+	
+	fi, err := os.Stat(localPath)
+	if err != nil {
+		return fmt.Errorf("Error stat local file: %v", err)
+	}
+	
+	if fi.IsDir() {
+		err = ftpConn.Conn.MakeDir(remotePath)
+		if err != nil {
+			fmt.Printf("FTP MakeDir %s (may already exist): %v\n", remotePath, err)
+		}
+		fmt.Printf("FTP created directory: %s\n", remotePath)
+		return nil
+	}
+	
+	dirs := strings.Split(filepath.ToSlash(filepath.Dir(remotePath)), "/")
+	currentPath := ""
+	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+		currentPath += "/" + dir
+		ftpConn.Conn.MakeDir(currentPath)
+	}
+	
+	file, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("Error opening local file: %v", err)
+	}
+	defer file.Close()
+	
+	err = ftpConn.Conn.Stor(remotePath, file)
+	if err != nil {
+		return fmt.Errorf("FTP upload error: %v", err)
+	}
+	
+	fmt.Printf("FTP uploaded: %s -> ftp://%s/%s\n", localPath, host, remotePath)
+	return nil
+}
+
+//________________________________________________________
+//Delete file or directory from FTP
+func deleteFromFTP(localPath, ftpURL string, rule SyncRule, isDir bool) error {
+	ftpConn, err := getFTPConnection(ftpURL)
+	if err != nil {
+		return err
+	}
+	
+	ftpConn.Mu.Lock()
+	defer ftpConn.Mu.Unlock()
+	
+	_, _, _, ftpPath, err := parseFTPURL(ftpURL)
+	if err != nil {
+		return err
+	}
+	
+	relPath := getTargetPath(localPath, rule)
+	remotePath := filepath.ToSlash(filepath.Join(ftpPath, relPath))
+	remotePath = strings.TrimPrefix(remotePath, "/")
+	
+	if isDir {
+		err = removeFTPDirectory(ftpConn.Conn, remotePath)
+		if err != nil {
+			return fmt.Errorf("FTP delete directory error: %v", err)
+		}
+		fmt.Printf("FTP deleted directory: %s\n", remotePath)
+	} else {
+		err = ftpConn.Conn.Delete(remotePath)
+		if err != nil {
+			return fmt.Errorf("FTP delete error: %v", err)
+		}
+		fmt.Printf("FTP deleted: %s\n", remotePath)
+	}
+	
+	return nil
+}
+
+//________________________________________________________
+//Recursively remove directory from FTP
+func removeFTPDirectory(conn *ftp.ServerConn, path string) error {
+	entries, err := conn.List(path)
+	if err != nil {
+		return err
+	}
+	
+	for _, entry := range entries {
+		entryPath := filepath.ToSlash(filepath.Join(path, entry.Name))
+		
+		if entry.Type == ftp.EntryTypeFolder {
+			err = removeFTPDirectory(conn, entryPath)
+			if err != nil {
+				return err
+			}
+		} else {
+			err = conn.Delete(entryPath)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	
+	err = conn.RemoveDir(path)
+	if err != nil {
+		return err
+	}
+	
+	return nil
 }
 
 //________________________________________________________
@@ -321,13 +553,26 @@ func getTargetPath(srcPath string, rule SyncRule) string {
 		relPath = filepath.Base(srcPath)
 	}
 	
-	return filepath.Join(rule.Target, relPath)
+	return relPath
 }
 
 //________________________________________________________
 //Copy file using rule (preserving directory structure)
 func copyFileWithRule(srcPath string, rule SyncRule) {
-	destPath := getTargetPath(srcPath, rule)
+	relPath := getTargetPath(srcPath, rule)
+	destPath := filepath.Join(rule.Target, relPath)
+	
+	fi, err := os.Stat(srcPath)
+	if err != nil {
+		fmt.Printf("Error stat: %v\n", err)
+		return
+	}
+	
+	if fi.IsDir() {
+		os.MkdirAll(destPath, 0755)
+		fmt.Printf("Created directory: %s\n", destPath)
+		return
+	}
 	
 	fmt.Printf("Copy: %s -> %s\n", srcPath, destPath)
 	
@@ -350,12 +595,11 @@ func copyFileWithRule(srcPath string, rule SyncRule) {
 
 //________________________________________________________
 //Execute sync rules for an event
-func executeRules(filePath string, action uint32, isDir bool, oldPath string) {
+func executeRules(filePath string, action uint32, isDir bool, oldPath string, oldIsDir bool) {
 	fmt.Printf("Checking rules for: %s (action=%d)\n", filePath, action)
 	
 	for _, rule := range syncRules {
 		if !matchPattern(rule.Pattern, filePath) {
-			fmt.Printf("  No match: %s != %s\n", filePath, rule.Pattern)
 			continue
 		}
 		
@@ -367,7 +611,8 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string) {
 				copyFileWithRule(filePath, rule)
 			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
 				copyFileWithRule(filePath, rule)
-				oldTarget := getTargetPath(oldPath, rule)
+				oldRelPath := getTargetPath(oldPath, rule)
+				oldTarget := filepath.Join(rule.Target, oldRelPath)
 				os.Remove(oldTarget)
 			}
 			
@@ -375,14 +620,60 @@ func executeRules(filePath string, action uint32, isDir bool, oldPath string) {
 			if action == windows.FILE_ACTION_ADDED || action == windows.FILE_ACTION_MODIFIED {
 				copyFileWithRule(filePath, rule)
 			} else if action == windows.FILE_ACTION_REMOVED {
-				targetPath := getTargetPath(filePath, rule)
-				os.Remove(targetPath)
+				relPath := getTargetPath(filePath, rule)
+				targetPath := filepath.Join(rule.Target, relPath)
+				if isDir {
+					os.RemoveAll(targetPath)
+				} else {
+					os.Remove(targetPath)
+				}
 				fmt.Printf("Sync deleted: %s\n", targetPath)
 			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
-				oldTarget := getTargetPath(oldPath, rule)
-				newTarget := getTargetPath(filePath, rule)
+				oldRelPath := getTargetPath(oldPath, rule)
+				newRelPath := getTargetPath(filePath, rule)
+				oldTarget := filepath.Join(rule.Target, oldRelPath)
+				newTarget := filepath.Join(rule.Target, newRelPath)
 				os.Rename(oldTarget, newTarget)
 				fmt.Printf("Sync renamed: %s -> %s\n", oldTarget, newTarget)
+			}
+			
+		case "ftp_copy":
+			if action == windows.FILE_ACTION_ADDED || action == windows.FILE_ACTION_MODIFIED {
+				err := uploadToFTP(filePath, rule.Target, rule)
+				if err != nil {
+					fmt.Printf("FTP upload error: %v\n", err)
+				}
+			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
+				err := uploadToFTP(filePath, rule.Target, rule)
+				if err != nil {
+					fmt.Printf("FTP upload error: %v\n", err)
+				}
+				err = deleteFromFTP(oldPath, rule.Target, rule, oldIsDir)
+				if err != nil {
+					fmt.Printf("FTP delete error: %v\n", err)
+				}
+			}
+			
+		case "ftp_sync":
+			if action == windows.FILE_ACTION_ADDED || action == windows.FILE_ACTION_MODIFIED {
+				err := uploadToFTP(filePath, rule.Target, rule)
+				if err != nil {
+					fmt.Printf("FTP upload error: %v\n", err)
+				}
+			} else if action == windows.FILE_ACTION_REMOVED {
+				err := deleteFromFTP(filePath, rule.Target, rule, isDir)
+				if err != nil {
+					fmt.Printf("FTP delete error: %v\n", err)
+				}
+			} else if action == windows.FILE_ACTION_RENAMED_NEW_NAME && oldPath != "" {
+				err := uploadToFTP(filePath, rule.Target, rule)
+				if err != nil {
+					fmt.Printf("FTP upload error: %v\n", err)
+				}
+				err = deleteFromFTP(oldPath, rule.Target, rule, oldIsDir)
+				if err != nil {
+					fmt.Printf("FTP delete error: %v\n", err)
+				}
 			}
 			
 		case "run":
@@ -760,15 +1051,12 @@ func startWatcher() {
 			case windows.FILE_ACTION_REMOVED:
 				if knownDirs[fullPath] {
 					isDir = true
-					delete(knownDirs, fullPath)
+					// НЕ удаляем из knownDirs, чтобы deleteFromFTP знал
 				}
 				
 			case windows.FILE_ACTION_RENAMED_OLD_NAME:
 				oldFullPath = fullPath
 				oldIsDir = isDir || knownDirs[fullPath]
-				if oldIsDir {
-					delete(knownDirs, fullPath)
-				}
 				
 			case windows.FILE_ACTION_RENAMED_NEW_NAME:
 				if isDir {
@@ -824,7 +1112,7 @@ func startWatcher() {
 					} else {
 						msg = fmt.Sprintf("ren file %s %s", oldFullPath, newBase)
 					}
-					executeRules(fullPath, info.Action, isDir, oldFullPath)
+					executeRules(fullPath, info.Action, isDir, oldFullPath, oldIsDir)
 					oldFullPath = ""
 					oldIsDir = false
 				} else {
@@ -844,7 +1132,12 @@ func startWatcher() {
 				})
 				
 				if info.Action != windows.FILE_ACTION_RENAMED_NEW_NAME {
-					executeRules(fullPath, info.Action, isDir, "")
+					executeRules(fullPath, info.Action, isDir, "", false)
+				}
+				
+				// После выполнения правил удаляем из knownDirs
+				if info.Action == windows.FILE_ACTION_REMOVED && isDir {
+					delete(knownDirs, fullPath)
 				}
 			}
 
@@ -886,7 +1179,12 @@ func onReady() {
 //________________________________________________________
 //Executes cleanup when exiting tray mode
 func onExit() {
-	// Cleanup procedures if required
+	ftpMutex.Lock()
+	for url, conn := range ftpConns {
+		conn.Conn.Quit()
+		fmt.Printf("FTP disconnected: %s\n", url)
+	}
+	ftpMutex.Unlock()
 }
 
 //________________________________________________________
