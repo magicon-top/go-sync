@@ -1,1 +1,57 @@
 *.tmp
+go-sync.log
+go-sync.exe
+go-sync-to-sheduler.bat
+go-sync-remove-sheduler.bat
+
+# === Временные файлы и бэкапы ===
+*.tmp
+*.bak
+*.swp
+*.swo
+*.log
+~*
+*.old
+*.cache
+
+# === Файлы блокировок ===
+*.lock
+index.lock
+maintenance.lock
+
+# === Системные файлы Windows ===
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+System Volume Information/
+
+# === Системы контроля версий ===
+.git/
+.gitignore
+.gitattributes
+.gitmodules
+
+# === Настройки редакторов и IDE ===
+# Visual Studio / VS Code
+.vs/
+.vscode/
+*.suo
+*.user
+*.userprefs
+*.csproj.user
+
+# JetBrains (GoLand, WebStorm, IDEA и др.)
+.idea/
+*.iml
+
+# Subversion
+.svn/
+
+# === Кэш компиляторов и сборщиков (включая Go) ===
+go-build*/
+build-cache/
+node_modules/
+dist/
+bin/
+obj/
