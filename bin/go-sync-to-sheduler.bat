@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-schtasks /create /tn "Go_SyncWatcher" /tr "powershell -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass -Command \"Start-Process '%CD%\go-sync.exe' -WorkingDir '%CD%' -NoNewWindow\"" /sc ONLOGON /rl HIGHEST /f
+schtasks /create /tn "Go_SyncWatcher" /tr "\"%CD%\go-sync.exe\"" /sc ONLOGON /ru "NT AUTHORITY\SYSTEM" /rl HIGHEST /f
 schtasks /run /tn "Go_SyncWatcher"
 
 

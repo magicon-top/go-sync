@@ -1,0 +1,1 @@
+robocopy "D:\WORK_DESIGN\_MAZLUM" "W:\WORK_DESIGN\MAZLUM" /E /XC /XN /XO /NP /R:3 /W:5

@@ -1,6 +1,6 @@
 ** ; echo  $event ---- $folder\ $file $ext  $type >> d:\_.txt
 * ; > W:\WORK_DESIGN\MY\
-** ; <> ftp://Login:password@1.loc:10021/usb1-part1/WORK_DESIGN/BAMSIC_2026
+** ; <> ftp://Login:password@192.168.0.1:21/usb1-part1/WORK_DESIGN/BAMSIC_2026
 
 
-#<> ftp://Login:password@1.loc:10021/usb1-part1/WORK_DESIGN/BAMSIC_2026
+#<> ftp://Login:password@192.168.0.1:21/usb1-part1/WORK_DESIGN/BAMSIC_2026
